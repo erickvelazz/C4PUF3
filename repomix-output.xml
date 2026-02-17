@@ -1,0 +1,1612 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+.python-version
+app.py
+ingesta.py
+main.py
+match_placa.py
+matching.py
+normalizacion.py
+pyproject.toml
+README.md
+tarifas.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+</file>
+
+<file path=".python-version">
+3.12
+</file>
+
+<file path="app.py">
+"""
+app.py — Interfaz Streamlit VET
+Uso: uv run streamlit run app.py
+"""
+
+import streamlit as st
+import pandas as pd
+import io
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+from ingesta     import leer_xlsx_ausur, leer_csv_salidas, limpiar_ausur, preparar_salidas_csv
+from matching    import hacer_match
+from match_placa import match_por_placa, UMBRAL_PLACA
+import matching as _m
+
+st.set_page_config(page_title="SAC-Peaje · VET", page_icon="🛣️",
+                   layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif}
+.stApp{background:#0d1117;color:#e6edf3}
+[data-testid="stSidebar"]{background:#161b22;border-right:1px solid #30363d}
+.hdr{background:linear-gradient(135deg,#0d1117,#161b22);border:1px solid #30363d;
+  border-left:4px solid #f78166;padding:20px 28px;margin-bottom:20px;font-family:'IBM Plex Mono',monospace}
+.hdr h1{color:#f78166;font-size:20px;font-weight:600;margin:0 0 4px 0;letter-spacing:.05em}
+.hdr p{color:#8b949e;font-size:12px;margin:0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:18px 20px;text-align:center}
+.card .v{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;line-height:1;margin-bottom:5px}
+.card .l{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.1em}
+.cg .v{color:#3fb950} .cr .v{color:#f85149} .cy .v{color:#e3b341}
+.cb .v{color:#58a6ff} .cp .v{color:#d2a8ff}
+.slbl{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#f78166;
+  text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+.stButton>button{background:#f78166!important;color:#0d1117!important;border:none!important;
+  font-family:'IBM Plex Mono',monospace!important;font-weight:600!important;
+  font-size:13px!important;border-radius:4px!important;width:100%}
+.stButton>button:hover{background:#ff9580!important}
+.stTabs [data-baseweb="tab-list"]{background:#161b22;border-bottom:1px solid #30363d}
+.stTabs [data-baseweb="tab"]{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#8b949e}
+.stTabs [aria-selected="true"]{color:#f78166!important;border-bottom:2px solid #f78166!important;background:transparent!important}
+hr{border-color:#30363d!important;margin:20px 0!important}
+.log{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:14px;
+  font-family:'IBM Plex Mono',monospace;font-size:12px;color:#8b949e;max-height:220px;overflow-y:auto}
+.lok{color:#3fb950} .lwarn{color:#e3b341} .lerr{color:#f85149}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session state ─────────────────────────────────────────────────────
+DEFAULTS = {
+    "run":         False,
+    "matched":     pd.DataFrame(),   # conciliados por Tag
+    "nuevos":      pd.DataFrame(),   # conciliados por Placa (origen=PENDIENTE_PLACA)
+    "duplicados":  pd.DataFrame(),   # duplicados AUSUR
+    "sin_e":       pd.DataFrame(),   # entradas sin match final
+    "sin_s":       pd.DataFrame(),   # salidas sin match final
+    "pend_sin":    pd.DataFrame(),   # pendientes que no matchearon por placa
+    "descartados": pd.DataFrame(),   # resto de descartados CSV
+    "xls":         None,
+    "logs":        [],
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Header ────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hdr">
+  <h1>▸ SAC-PEAJE · MÓDULO VET</h1>
+  <p>Conciliación Peaje Cerrado · AUSUR (entradas) vs CSV (salidas)</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Sidebar ───────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown('<p class="slbl">01 · Entradas — AUSUR</p>', unsafe_allow_html=True)
+    f_ausur = st.file_uploader("Cruces_AUSUR_XXXXXXXX.xlsx", type=["xlsx"],
+        help="Archivo AUSUR con las entradas. Se limpiará primero.")
+
+    st.markdown("---")
+    st.markdown('<p class="slbl">02 · Salidas — Report CSV</p>', unsafe_allow_html=True)
+    f_csv = st.file_uploader("report_XXXX.csv", type=["csv", "txt"],
+        help="CSV con entradas (A) y salidas (B). Solo se usan B estatus 10.")
+
+    st.markdown("---")
+    st.markdown('<p class="slbl">03 · Parámetros</p>', unsafe_allow_html=True)
+    ventana = st.slider("Ventana máxima de match (min)", 30, 360, 120, 15,
+        help="Tiempo máximo entre entrada y salida del mismo Tag")
+    umbral_placa = st.slider("Umbral match por placa (%)", 60, 95, int(UMBRAL_PLACA * 100), 5,
+        help="Score mínimo para aceptar match por placa. 75% = hasta 2 chars distintos")
+
+    st.markdown("---")
+    listos = f_ausur is not None and f_csv is not None
+    boton  = st.button("▸  EJECUTAR", disabled=not listos, use_container_width=True)
+    if not listos:
+        falta = [n for n, f in [("AUSUR", f_ausur), ("CSV", f_csv)] if f is None]
+        st.caption(f"⬆ Falta: {', '.join(falta)}")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+def log(msg, t="ok"):
+    cls = {"ok": "lok", "warn": "lwarn", "err": "lerr"}.get(t, "")
+    ts  = datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f'<span class="{cls}">[{ts}] {msg}</span>')
+
+def tmp(f):
+    suf = Path(f.name).suffix
+    t   = tempfile.NamedTemporaryFile(delete=False, suffix=suf)
+    t.write(f.getvalue()); t.flush()
+    return t.name
+
+def generar_xls():
+    s   = st.session_state
+    buf = io.BytesIO()
+    # Unir matched + nuevos en una sola hoja Conciliados
+    df_todos = pd.concat([s.matched, s.nuevos], ignore_index=True)
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for df, sheet in [
+            (df_todos,      "Conciliados"),
+            (s.duplicados,  "Duplicados_AUSUR"),
+            (s.sin_e,       "Sin_Match_Entradas"),
+            (s.sin_s,       "Sin_Match_Salidas"),
+            (s.pend_sin,    "Pendientes"),
+            (s.descartados, "Descartados_CSV"),
+        ]:
+            if not df.empty:
+                df.to_excel(w, sheet_name=sheet, index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+def card(col, cls, val, lbl):
+    with col:
+        st.markdown(f'<div class="card {cls}"><div class="v">{val}</div>'
+                    f'<div class="l">{lbl}</div></div>', unsafe_allow_html=True)
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────
+if boton and listos:
+    st.session_state.logs = []
+    st.session_state.run  = False
+    _m.VENTANA_MAX_MINUTOS = ventana
+
+    # Aplicar umbral dinámico del slider
+    import match_placa as _mp
+    _mp.UMBRAL_PLACA = umbral_placa / 100
+
+    with st.spinner("Procesando..."):
+        try:
+            ra = tmp(f_ausur)
+            rc = tmp(f_csv)
+
+            # ── Proceso 1: Limpiar AUSUR ──────────────────────────────
+            log(f"Leyendo AUSUR: {f_ausur.name}")
+            df_ausur = leer_xlsx_ausur(ra)
+            res_a    = limpiar_ausur(df_ausur)
+            df_e     = res_a["entradas_limpias"]
+            df_dup   = res_a["duplicados"]
+            log(f"AUSUR limpias: {len(df_e):,} | Duplicados (≤10 seg): {len(df_dup):,}",
+                "warn" if len(df_dup) > 0 else "ok")
+
+            # ── Proceso 2: Preparar salidas ───────────────────────────
+            log(f"Leyendo salidas: {f_csv.name}")
+            df_csv_raw = leer_csv_salidas(rc)
+            res_c      = preparar_salidas_csv(df_csv_raw)
+            df_s       = res_c["salidas"]
+            df_pend    = res_c["pendientes"]
+            df_desc    = res_c["descartados"]
+            log(f"Salidas (B est.10): {len(df_s):,} | Pendientes (4/8): {len(df_pend):,} | Descartados: {len(df_desc):,}")
+
+            # ── Proceso 3: Match por Tag ──────────────────────────────
+            log("Ejecutando match por Tag exacto...")
+            res_m  = hacer_match(df_e, df_s)
+            df_m   = res_m["matched"]
+            df_se  = res_m["sin_match_e"]
+            df_ss  = res_m["sin_match_s"]
+            df_m["origen"] = "TAG_EXACTO"
+            log(f"Tag exacto: {len(df_m):,} | Sin match E: {len(df_se):,} | S: {len(df_ss):,}",
+                "warn" if len(df_se) > 0 else "ok")
+
+            # ── Proceso 4: Match por Placa (Pendientes) ───────────────
+            log(f"Match por placa — {len(df_pend):,} pendientes vs sin-match (umbral {umbral_placa}%)...")
+            res_p       = match_por_placa(df_pend, df_se, df_ss)
+            df_nuevos   = res_p["nuevos_conciliados"]
+            df_pend_sin = res_p["pendientes_sin_match"]
+            df_se2      = res_p["sin_match_e_restante"]
+            df_ss2      = res_p["sin_match_s_restante"]
+            log(f"Por placa: {len(df_nuevos):,} | Pendientes sin match: {len(df_pend_sin):,}",
+                "warn" if len(df_pend_sin) > 0 else "ok")
+
+            total = len(df_m) + len(df_nuevos)
+            pct   = total / max(len(df_e), 1) * 100
+            log(f"Total conciliados: {total:,} ({pct:.1f}%)", "ok")
+
+            # Guardar en session state
+            st.session_state.matched     = df_m
+            st.session_state.nuevos      = df_nuevos
+            st.session_state.duplicados  = df_dup
+            st.session_state.sin_e       = df_se2
+            st.session_state.sin_s       = df_ss2
+            st.session_state.pend_sin    = df_pend_sin
+            st.session_state.descartados = df_desc
+            st.session_state.xls         = generar_xls()
+            st.session_state.run         = True
+            log("Pipeline completado.")
+
+        except Exception as e:
+            log(f"ERROR: {e}", "err")
+            st.error(f"Error: {e}")
+            st.exception(e)
+
+
+# ── Resultados ────────────────────────────────────────────────────────
+if not st.session_state.run:
+    c1, c2, c3 = st.columns(3)
+    for col, n, t in [(c1,"01","Carga el AUSUR"), (c2,"02","Carga el CSV"), (c3,"03","Ejecuta")]:
+        with col:
+            st.markdown(f'<div class="card"><div class="v" style="color:#8b949e">{n}</div>'
+                        f'<div class="l">{t}</div></div>', unsafe_allow_html=True)
+else:
+    s        = st.session_state
+    total    = len(s.matched) + len(s.nuevos)
+    pct      = total / max(total + len(s.sin_e), 1) * 100
+
+    # ── Métricas ──────────────────────────────────────────────────────
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    card(c1, "cg", f"{total:,}",            "Conciliados total")
+    card(c2, "cg", f"{len(s.matched):,}",   "· Por Tag")
+    card(c3, "cp", f"{len(s.nuevos):,}",    "· Por Placa")
+    card(c4, "cy", f"{len(s.sin_e):,}",     "Sin match (E)")
+    card(c5, "cr", f"{len(s.duplicados):,}","Duplicados AUSUR")
+    card(c6, "cb", f"{pct:.1f}%",           "Tasa conciliación")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Descarga ──────────────────────────────────────────────────────
+    cd, _ = st.columns([2, 6])
+    with cd:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        st.download_button("⬇  DESCARGAR EXCEL", data=s.xls,
+            file_name=f"VET_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Tabs ──────────────────────────────────────────────────────────
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+        f"✅ Tag ({len(s.matched):,})",
+        f"🔤 Placa ({len(s.nuevos):,})",
+        f"🔍 Duplicados AUSUR ({len(s.duplicados):,})",
+        f"⚠️ Sin Match ({len(s.sin_e)+len(s.sin_s):,})",
+        f"🕐 Pendientes sin match ({len(s.pend_sin):,})",
+        f"🗑️ Descartados ({len(s.descartados):,})",
+        "🖥 Log",
+    ])
+
+    # Tab 1 — Conciliados por Tag
+    with t1:
+        if s.matched.empty:
+            st.info("Sin conciliados por Tag.")
+        else:
+            if "datetime_entrada" in s.matched.columns:
+                st.markdown('<p class="slbl">Cruces por hora del día</p>', unsafe_allow_html=True)
+                df_h = s.matched.copy()
+                df_h["hora"] = pd.to_datetime(df_h["datetime_entrada"]).dt.hour
+                st.bar_chart(df_h["hora"].value_counts().sort_index(), color="#f78166")
+                st.markdown("---")
+            st.dataframe(s.matched, use_container_width=True, hide_index=True, height=400)
+
+    # Tab 2 — Conciliados por Placa
+    with t2:
+        if s.nuevos.empty:
+            st.info("No se generaron conciliados por placa.")
+        else:
+            st.success(f"{len(s.nuevos):,} registros pendientes conciliados por similitud de placa.")
+            if "pct_match_placa" in s.nuevos.columns:
+                st.markdown('<p class="slbl">Distribución de score de match</p>', unsafe_allow_html=True)
+                scores = s.nuevos["pct_match_placa"].str.replace("%","").astype(float)
+                c_a, c_b, c_c = st.columns(3)
+                with c_a:
+                    st.markdown(f'<div class="card cb"><div class="v">{scores.mean():.0f}%</div><div class="l">Score promedio</div></div>', unsafe_allow_html=True)
+                with c_b:
+                    st.markdown(f'<div class="card cg"><div class="v">{scores.max():.0f}%</div><div class="l">Score máximo</div></div>', unsafe_allow_html=True)
+                with c_c:
+                    st.markdown(f'<div class="card cy"><div class="v">{scores.min():.0f}%</div><div class="l">Score mínimo</div></div>', unsafe_allow_html=True)
+                st.markdown("---")
+            st.caption("Bandera: origen = PENDIENTE_PLACA")
+            st.dataframe(s.nuevos, use_container_width=True, hide_index=True, height=380)
+
+    # Tab 3 — Duplicados AUSUR
+    with t3:
+        if s.duplicados.empty:
+            st.success("No se encontraron duplicados en AUSUR.")
+        else:
+            st.warning(f"{len(s.duplicados):,} registros con mismo Tag dentro de 10 segundos. Requieren revisión manual.")
+            st.caption("Estos registros NO entraron al proceso de match.")
+            st.dataframe(s.duplicados, use_container_width=True, hide_index=True, height=380)
+
+    # Tab 4 — Sin Match
+    with t4:
+        se_tab, ss_tab = st.tabs([
+            f"Entradas sin match ({len(s.sin_e):,})",
+            f"Salidas sin match ({len(s.sin_s):,})",
+        ])
+        with se_tab:
+            if s.sin_e.empty:
+                st.success("Todas las entradas encontraron match.")
+            else:
+                st.warning(f"{len(s.sin_e):,} entradas AUSUR sin salida correspondiente.")
+                st.dataframe(s.sin_e, use_container_width=True, hide_index=True, height=360)
+        with ss_tab:
+            if s.sin_s.empty:
+                st.success("Todas las salidas fueron emparejadas.")
+            else:
+                st.warning(f"{len(s.sin_s):,} salidas CSV sin entrada correspondiente.")
+                st.dataframe(s.sin_s, use_container_width=True, hide_index=True, height=360)
+
+    # Tab 5 — Pendientes sin match
+    with t5:
+        if s.pend_sin.empty:
+            st.success("Todos los pendientes encontraron match por placa.")
+        else:
+            st.warning(f"{len(s.pend_sin):,} pendientes (status 4/8) sin placa con score ≥ {umbral_placa}%. Revisión manual.")
+            st.dataframe(s.pend_sin, use_container_width=True, hide_index=True, height=380)
+
+    # Tab 6 — Descartados
+    with t6:
+        if s.descartados.empty:
+            st.success("Sin descartados del CSV.")
+        else:
+            if "Clasificacion" in s.descartados.columns:
+                motivos = s.descartados["Clasificacion"].value_counts().reset_index()
+                motivos.columns = ["Motivo", "Cantidad"]
+                st.dataframe(motivos, use_container_width=True, hide_index=True)
+                st.markdown("---")
+            st.dataframe(s.descartados, use_container_width=True, hide_index=True, height=320)
+
+    # Tab 7 — Log
+    with t7:
+        st.markdown('<p class="slbl">Log de ejecución</p>', unsafe_allow_html=True)
+        html = "<br>".join(s.logs) if s.logs else "Sin logs."
+        st.markdown(f'<div class="log">{html}</div>', unsafe_allow_html=True)
+</file>
+
+<file path="ingesta.py">
+"""
+ingesta.py — Lectura y limpieza
+PROCESO 1: Limpiar AUSUR (entradas) — detectar duplicados por Tag + 10 seg
+PROCESO 2: Leer salidas CSV — filtrar estatus 10
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ══════════════════════════════════════════════════════════════════════
+# COLUMNAS REALES DE LOS ARCHIVOS
+# ══════════════════════════════════════════════════════════════════════
+
+XLSX_TAG      = "NUMERO_TAG"
+XLSX_DATETIME = "FECHA_HORA"
+XLSX_CARRIL   = "CVE_CARRIL"
+XLSX_PLACA    = "PLACA"
+XLSX_TRAMO    = "TRAMO"
+XLSX_UUID     = "UUID"
+
+CSV_TAG       = "Numero Tag"
+CSV_DATETIME  = "Fecha Hora"
+CSV_CUERPO    = "Cve Cuerpo"   # A=entrada, B=salida
+CSV_ESTATUS   = "Id Clasifica" # 10 = válido
+CSV_CARRIL    = "Cve Carril"
+CSV_PLACA     = "Placa"
+CSV_UUID      = "Uuid"
+CSV_CLASIF    = "Clasificacion"
+
+VENTANA_DUPLICADO_SEG = 10   # segundos para considerar mismo registro
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LECTURA
+# ══════════════════════════════════════════════════════════════════════
+
+def leer_xlsx_ausur(ruta: str) -> pd.DataFrame:
+    """Lee el XLSX de entradas AUSUR."""
+    ruta = Path(ruta)
+    print(f"[INGESTA] Leyendo AUSUR: {ruta.name}")
+    df = pd.read_excel(ruta, dtype=str)
+    df.columns = df.columns.str.strip()
+    df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
+    print(f"[INGESTA] Registros AUSUR crudos: {len(df):,}")
+    return df
+
+
+def leer_csv_salidas(ruta: str) -> pd.DataFrame:
+    """Lee el CSV de salidas (report)."""
+    ruta = Path(ruta)
+    print(f"[INGESTA] Leyendo salidas: {ruta.name}")
+    df = pd.read_csv(
+        ruta, dtype=str, encoding="utf-8",
+        encoding_errors="replace", skip_blank_lines=True,
+    )
+    df.columns = df.columns.str.strip().str.replace('"', '')
+    df = df.apply(lambda c: c.str.strip().str.replace('"', '')
+                  if c.dtype == object else c)
+    print(f"[INGESTA] Registros salidas crudos: {len(df):,}")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PROCESO 1 — LIMPIAR AUSUR
+# ══════════════════════════════════════════════════════════════════════
+
+def limpiar_ausur(df: pd.DataFrame) -> dict:
+    """
+    Limpia el archivo AUSUR (entradas).
+
+    Lógica de duplicados:
+      - Mismo Tag + misma fecha/hora dentro de 10 segundos → duplicado
+      - Se conserva el PRIMERO en tiempo (más antiguo)
+      - Los duplicados van a pestaña de revisión manual
+
+    Retorna dict con:
+      'entradas_limpias' : DataFrame listo para match
+      'duplicados'       : DataFrame para revisión manual
+    """
+    df = df.copy()
+
+    # ── 1. Limpiar nulos ──────────────────────────────────────────────
+    df.replace(["-", "nan", "NaN", "", "NULL"], np.nan, inplace=True)
+
+    # Limpiar basura en NOM_IMG_PLACA
+    if "NOM_IMG_PLACA" in df.columns:
+        df["NOM_IMG_PLACA"] = df["NOM_IMG_PLACA"].apply(
+            lambda x: np.nan if pd.isna(x) or "_x0000_" in str(x) else x
+        )
+
+    # ── 2. Normalizar Tag ─────────────────────────────────────────────
+    df[XLSX_TAG] = df[XLSX_TAG].str.upper().str.strip()
+
+    # ── 3. Parsear datetime (formato XLSX: YYYY-MM-DD HH:MM:SS) ──────
+    df["datetime"] = pd.to_datetime(df[XLSX_DATETIME], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+
+    mask_fecha_mala = df["datetime"].isna()
+    if mask_fecha_mala.any():
+        print(f"[AUSUR] Fechas no parseables descartadas: {mask_fecha_mala.sum():,}")
+        df = df[~mask_fecha_mala].copy()
+
+    # ── 4. Ordenar por Tag + datetime (para quedarnos con el primero) ─
+    df = df.sort_values([XLSX_TAG, "datetime"]).reset_index(drop=True)
+
+    # ── 5. Detectar duplicados: mismo Tag, diferencia <= 10 segundos ──
+    #
+    # Estrategia: dentro de cada grupo de Tag,
+    # comparar cada registro contra el ANTERIOR del mismo Tag.
+    # Si la diferencia de tiempo es <= 10 seg → es duplicado del anterior.
+
+    df["_tag_ant"]  = df[XLSX_TAG].shift(1)
+    df["_dt_ant"]   = df["datetime"].shift(1)
+    df["_diff_seg"] = (df["datetime"] - df["_dt_ant"]).dt.total_seconds()
+
+    # Es duplicado si: mismo Tag que el anterior Y diferencia <= 10 seg
+    df["_es_duplicado"] = (
+        (df[XLSX_TAG] == df["_tag_ant"]) &
+        (df["_diff_seg"].abs() <= VENTANA_DUPLICADO_SEG)
+    )
+
+    df_duplicados = df[df["_es_duplicado"]].copy()
+    df_limpios    = df[~df["_es_duplicado"]].copy()
+
+    # Limpiar columnas auxiliares
+    cols_aux = ["_tag_ant", "_dt_ant", "_diff_seg", "_es_duplicado"]
+    df_duplicados = df_duplicados.drop(columns=cols_aux, errors="ignore")
+    df_limpios    = df_limpios.drop(columns=cols_aux, errors="ignore")
+
+    df_duplicados["motivo_revision"] = "Duplicado AUSUR (mismo Tag ≤10 seg)"
+
+    print(f"[AUSUR] Entradas limpias  : {len(df_limpios):,}")
+    print(f"[AUSUR] Duplicados marcados: {len(df_duplicados):,}")
+
+    return {
+        "entradas_limpias": df_limpios,
+        "duplicados":       df_duplicados,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PROCESO 2 — PREPARAR SALIDAS CSV
+# ══════════════════════════════════════════════════════════════════════
+
+# Estatus que van a la pestaña Pendientes (para match por placa)
+ESTATUS_PENDIENTES = {"4", "8"}
+
+def preparar_salidas_csv(df: pd.DataFrame) -> dict:
+    """
+    Del CSV de salidas extrae:
+      - df_salidas    : tipo B estatus 10  → match por Tag
+      - df_pendientes : tipo B estatus 4 u 8 → match por placa (paso 2)
+      - df_descartados: tipo B cualquier otro estatus
+
+    Retorna dict con las tres tablas.
+    """
+    df = df.copy()
+
+    df_b = df[df[CSV_CUERPO] == "B"].copy()
+    print(f"[SALIDAS] Total registros B: {len(df_b):,}")
+
+    # Separar en tres grupos
+    mask_10   = df_b[CSV_ESTATUS] == "10"
+    mask_pend = df_b[CSV_ESTATUS].isin(ESTATUS_PENDIENTES)
+
+    df_salidas      = df_b[mask_10].copy()
+    df_pendientes   = df_b[mask_pend].copy()
+    df_descartados  = df_b[~mask_10 & ~mask_pend].copy()
+
+    print(f"[SALIDAS] Estatus 10 (match Tag)  : {len(df_salidas):,}")
+    print(f"[SALIDAS] Pendientes (est. 4 y 8) : {len(df_pendientes):,}")
+    print(f"[SALIDAS] Descartados             : {len(df_descartados):,}")
+    if CSV_CLASIF in df_descartados.columns and len(df_descartados) > 0:
+        for motivo, cnt in df_descartados[CSV_CLASIF].value_counts().items():
+            print(f"          · {motivo}: {cnt:,}")
+
+    # Normalizar salidas estatus 10
+    df_salidas.replace(["-", "nan", "NaN", "", "NULL"], np.nan, inplace=True)
+    df_salidas[CSV_TAG]   = df_salidas[CSV_TAG].str.upper().str.strip()
+    df_salidas[CSV_PLACA] = df_salidas[CSV_PLACA].str.upper().str.strip()
+    df_salidas["datetime"] = pd.to_datetime(
+        df_salidas[CSV_DATETIME], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+    mask_mala = df_salidas["datetime"].isna()
+    if mask_mala.any():
+        df_salidas = df_salidas[~mask_mala].copy()
+
+    # Normalizar pendientes
+    df_pendientes.replace(["-", "nan", "NaN", "", "NULL"], np.nan, inplace=True)
+    df_pendientes[CSV_PLACA] = df_pendientes[CSV_PLACA].str.upper().str.strip()
+    df_pendientes["datetime"] = pd.to_datetime(
+        df_pendientes[CSV_DATETIME], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+    df_pendientes["origen"] = "CSV"
+
+    print(f"[SALIDAS] Salidas válidas para match Tag: {len(df_salidas):,}")
+    return {
+        "salidas":      df_salidas,
+        "pendientes":   df_pendientes,
+        "descartados":  df_descartados,
+    }
+
+
+def extraer_pendientes_ausur(df_ausur_crudo: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extrae del AUSUR original los registros con estatus 4 u 8.
+    El AUSUR no tiene columna de estatus explícita en los datos vistos,
+    pero si la tuviera se filtraría aquí. Por ahora retorna vacío
+    y se puede extender cuando se confirme el campo de estatus en AUSUR.
+    """
+    # Si el AUSUR tiene columna de estatus, filtrar aquí
+    col_est = next((c for c in df_ausur_crudo.columns
+                    if "clasif" in c.lower() or "status" in c.lower() or "estatus" in c.lower()), None)
+    if col_est:
+        mask = df_ausur_crudo[col_est].astype(str).isin(ESTATUS_PENDIENTES)
+        df_pend = df_ausur_crudo[mask].copy()
+        df_pend["origen"] = "AUSUR"
+        print(f"[AUSUR] Pendientes (est. 4/8): {len(df_pend):,}")
+        return df_pend
+    return pd.DataFrame()
+</file>
+
+<file path="main.py">
+"""
+main.py — Orquestador VET
+Uso: uv run python main.py --ausur Cruces_AUSUR.xlsx --salidas report.csv
+"""
+
+import pandas as pd
+import argparse
+from pathlib import Path
+from datetime import datetime
+
+from ingesta     import (leer_xlsx_ausur, leer_csv_salidas,
+                          limpiar_ausur, preparar_salidas_csv,
+                          extraer_pendientes_ausur)
+from matching    import hacer_match
+from match_placa import match_por_placa
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def run_pipeline(ruta_ausur: str, ruta_salidas: str) -> dict:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"\n{'='*55}\n  MÓDULO VET — {ts}\n{'='*55}")
+
+    # ── PROCESO 1: Limpieza AUSUR ─────────────────────────────────────
+    print("\n── PROCESO 1: Limpieza AUSUR ──")
+    df_ausur_crudo = leer_xlsx_ausur(ruta_ausur)
+    res_ausur      = limpiar_ausur(df_ausur_crudo)
+    df_entradas    = res_ausur["entradas_limpias"]
+    df_duplicados  = res_ausur["duplicados"]
+
+    # Pendientes del AUSUR (estatus 4/8 si existen)
+    df_pend_ausur  = extraer_pendientes_ausur(df_ausur_crudo)
+
+    # ── PROCESO 2: Preparar salidas CSV ───────────────────────────────
+    print("\n── PROCESO 2: Preparar Salidas ──")
+    df_csv_crudo   = leer_csv_salidas(ruta_salidas)
+    res_csv        = preparar_salidas_csv(df_csv_crudo)
+    df_salidas     = res_csv["salidas"]
+    df_pend_csv    = res_csv["pendientes"]
+    df_descartados = res_csv["descartados"]
+
+    # Unir pendientes de ambas fuentes
+    df_pendientes = pd.concat([df_pend_csv, df_pend_ausur], ignore_index=True)
+
+    # ── PROCESO 3: Match por Tag ──────────────────────────────────────
+    print("\n── PROCESO 3: Match por Tag ──")
+    res_match     = hacer_match(df_entradas, df_salidas)
+    df_matched    = res_match["matched"]
+    df_sin_e      = res_match["sin_match_e"]
+    df_sin_s      = res_match["sin_match_s"]
+
+    # ── PROCESO 4: Match por Placa (Pendientes) ───────────────────────
+    print("\n── PROCESO 4: Match por Placa ──")
+    res_placa      = match_por_placa(df_pendientes, df_sin_e, df_sin_s)
+    df_match_placa = res_placa["matched_placa"]
+    df_pend_sin    = res_placa["pendientes_sin_match"]
+    df_sin_e_final = res_placa["sin_match_e_resto"]
+    df_sin_s_final = res_placa["sin_match_s_resto"]
+
+    # ── Reporte ───────────────────────────────────────────────────────
+    ruta_out = _generar_excel(
+        df_matched, df_match_placa, df_duplicados,
+        df_pendientes, df_pend_sin,
+        df_sin_e_final, df_sin_s_final,
+        df_descartados, ts
+    )
+
+    _imprimir_resumen(
+        df_ausur_crudo, df_entradas, df_duplicados,
+        df_salidas, df_pendientes,
+        df_matched, df_match_placa,
+        df_sin_e_final, df_sin_s_final
+    )
+
+    return {
+        "matched":       df_matched,
+        "matched_placa": df_match_placa,
+        "duplicados":    df_duplicados,
+        "pendientes":    df_pendientes,
+        "pend_sin":      df_pend_sin,
+        "sin_match_e":   df_sin_e_final,
+        "sin_match_s":   df_sin_s_final,
+        "ruta":          ruta_out,
+    }
+
+
+def _generar_excel(df_m, df_mp, df_dup, df_pend, df_pend_sin,
+                   df_se, df_ss, df_desc, ts) -> Path:
+    ruta = OUTPUT_DIR / f"VET_{ts}.xlsx"
+    with pd.ExcelWriter(ruta, engine="openpyxl") as w:
+        sheets = [
+            (df_m,        "Conciliados_Tag"),
+            (df_mp,       "Conciliados_Placa"),
+            (df_dup,      "Duplicados_AUSUR"),
+            (df_pend,     "Pendientes"),
+            (df_pend_sin, "Pendientes_Sin_Match"),
+            (df_se,       "Sin_Match_Entradas"),
+            (df_ss,       "Sin_Match_Salidas"),
+            (df_desc,     "Descartados_CSV"),
+        ]
+        for df, sheet in sheets:
+            if not df.empty:
+                df.to_excel(w, sheet_name=sheet, index=False)
+    print(f"\n[OUTPUT] {ruta}")
+    return ruta
+
+
+def _imprimir_resumen(df_crudo, df_e, df_dup, df_s, df_pend,
+                      df_m, df_mp, df_se, df_ss):
+    total_conc = len(df_m) + len(df_mp)
+    total_e    = len(df_e)
+    pct        = total_conc / max(total_e, 1) * 100
+    print(f"\n{'='*55}")
+    print("  RESUMEN")
+    print(f"{'='*55}")
+    print(f"  AUSUR crudos           : {len(df_crudo):>7,}")
+    print(f"  Entradas limpias       : {len(df_e):>7,}")
+    print(f"  Duplicados AUSUR       : {len(df_dup):>7,}")
+    print(f"  Salidas válidas (B+10) : {len(df_s):>7,}")
+    print(f"  Pendientes (est. 4/8)  : {len(df_pend):>7,}")
+    print(f"  ─────────────────────────────────")
+    print(f"  Conciliados por Tag    : {len(df_m):>7,}")
+    print(f"  Conciliados por Placa  : {len(df_mp):>7,}")
+    print(f"  Total conciliados      : {total_conc:>7,}")
+    print(f"  Sin match (entradas)   : {len(df_se):>7,}")
+    print(f"  Sin match (salidas)    : {len(df_ss):>7,}")
+    print(f"  Tasa conciliación      : {pct:>6.1f}%")
+    print(f"{'='*55}\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ausur",   required=True)
+    parser.add_argument("--salidas", required=True)
+    args = parser.parse_args()
+    run_pipeline(args.ausur, args.salidas)
+</file>
+
+<file path="match_placa.py">
+"""
+match_placa.py — Match difuso por placa entre Pendientes y sin-match
+Proceso:
+  1. Separar pendientes (status 4 y 8) del resto de descartados
+  2. Para cada pendiente buscar la mejor placa en entradas sin match Y salidas sin match
+  3. Score carácter por carácter usando SequenceMatcher
+  4. Umbral mínimo: 75% (captura hasta 2 dígitos distintos en placa de 7 chars)
+  5. Los que superan el umbral van a Conciliados con bandera origen="PENDIENTE_PLACA"
+"""
+
+import pandas as pd
+import numpy as np
+from difflib import SequenceMatcher
+
+UMBRAL_PLACA     = 0.75   # 75% — permite hasta 2 chars distintos en placa de 7
+STATUS_PENDIENTE = ["4", "8"]
+
+# Columnas de placa en cada archivo
+PLACA_CSV  = "Placa"
+PLACA_XLSX = "PLACA"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SEPARAR PENDIENTES DEL RESTO DE DESCARTADOS
+# ══════════════════════════════════════════════════════════════════════
+
+def separar_pendientes(df_descartados: pd.DataFrame) -> dict:
+    """
+    Divide df_descartados en:
+      'pendientes' : status 4 y 8  → van al match por placa
+      'resto'      : cualquier otro status
+    """
+    if df_descartados.empty:
+        return {"pendientes": pd.DataFrame(), "resto": pd.DataFrame()}
+
+    col_status = "Id Clasifica"
+    if col_status not in df_descartados.columns:
+        # Buscar columna alternativa
+        for c in df_descartados.columns:
+            if "clasifica" in c.lower() or "status" in c.lower() or "estatus" in c.lower():
+                col_status = c
+                break
+
+    mask_pend    = df_descartados[col_status].astype(str).isin(STATUS_PENDIENTE)
+    df_pendientes = df_descartados[mask_pend].copy()
+    df_resto      = df_descartados[~mask_pend].copy()
+
+    print(f"[PENDIENTES] Status 4 y 8: {len(df_pendientes):,}")
+    print(f"[PENDIENTES] Resto descartados: {len(df_resto):,}")
+
+    return {"pendientes": df_pendientes, "resto": df_resto}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MATCH DIFUSO POR PLACA
+# ══════════════════════════════════════════════════════════════════════
+
+def match_por_placa(
+    df_pendientes: pd.DataFrame,
+    df_sin_match_e: pd.DataFrame,
+    df_sin_match_s: pd.DataFrame,
+) -> dict:
+    """
+    Hace match difuso por placa entre:
+      - df_pendientes  ← los status 4 y 8
+      - df_sin_match_e ← entradas AUSUR sin match de Tag
+      - df_sin_match_s ← salidas CSV sin match de Tag
+
+    Para cada pendiente:
+      1. Extrae la placa y la normaliza
+      2. Compara carácter por carácter contra todas las placas en sin_match_e y sin_match_s
+      3. Toma el mejor candidato si supera el umbral 75%
+      4. Prioriza sin_match_e, si no encuentra ahí busca en sin_match_s
+
+    Retorna:
+      'nuevos_conciliados': pares con bandera origen='PENDIENTE_PLACA' y columna pct_match
+      'pendientes_sin_match': pendientes que no encontraron pareja
+      'sin_match_e_restante': entradas que siguen sin match
+      'sin_match_s_restante': salidas que siguen sin match
+    """
+    if df_pendientes.empty:
+        return {
+            "nuevos_conciliados":    pd.DataFrame(),
+            "pendientes_sin_match":  df_pendientes,
+            "sin_match_e_restante":  df_sin_match_e,
+            "sin_match_s_restante":  df_sin_match_s,
+        }
+
+    # Normalizar placas en los tres DataFrames
+    pend  = df_pendientes.copy()
+    sin_e = df_sin_match_e.copy()
+    sin_s = df_sin_match_s.copy()
+
+    pend["_placa_norm"]  = _norm_placa(pend,  PLACA_CSV)
+    sin_e["_placa_norm"] = _norm_placa(sin_e, PLACA_XLSX)
+    sin_s["_placa_norm"] = _norm_placa(sin_s, PLACA_CSV)
+
+    nuevos          = []
+    idx_e_usados    = set()
+    idx_s_usados    = set()
+    idx_pend_sin    = []
+
+    print(f"\n[MATCH PLACA] Pendientes: {len(pend):,} | Sin match E: {len(sin_e):,} | Sin match S: {len(sin_s):,}")
+
+    for idx_p, pendiente in pend.iterrows():
+        placa_p = pendiente.get("_placa_norm", "")
+
+        if not placa_p or placa_p == "-":
+            idx_pend_sin.append(idx_p)
+            continue
+
+        # ── Buscar en entradas sin match ──────────────────────────────
+        mejor_e = _buscar_mejor(placa_p, sin_e, idx_e_usados)
+
+        # ── Buscar en salidas sin match ───────────────────────────────
+        mejor_s = _buscar_mejor(placa_p, sin_s, idx_s_usados)
+
+        # ── Elegir el mejor entre E y S ───────────────────────────────
+        candidato = None
+        if mejor_e and mejor_s:
+            candidato = mejor_e if mejor_e["score"] >= mejor_s["score"] else mejor_s
+        elif mejor_e:
+            candidato = mejor_e
+        elif mejor_s:
+            candidato = mejor_s
+
+        if candidato:
+            par = _construir_par_placa(pendiente, candidato)
+            nuevos.append(par)
+            if candidato["origen"] == "entrada":
+                idx_e_usados.add(candidato["idx"])
+            else:
+                idx_s_usados.add(candidato["idx"])
+        else:
+            idx_pend_sin.append(idx_p)
+
+    # Consolidar resultados
+    df_nuevos = pd.DataFrame(nuevos) if nuevos else pd.DataFrame()
+
+    df_pend_sin = pend.loc[idx_pend_sin].drop(columns=["_placa_norm"], errors="ignore").copy()
+    df_pend_sin["motivo"] = "Sin placa coincidente (score < 75%)"
+
+    df_sin_e_rest = sin_e[~sin_e.index.isin(idx_e_usados)].drop(columns=["_placa_norm"], errors="ignore").copy()
+    df_sin_s_rest = sin_s[~sin_s.index.isin(idx_s_usados)].drop(columns=["_placa_norm"], errors="ignore").copy()
+
+    print(f"[MATCH PLACA] Nuevos conciliados por placa: {len(df_nuevos):,}")
+    print(f"[MATCH PLACA] Pendientes sin match:         {len(df_pend_sin):,}")
+
+    return {
+        "nuevos_conciliados":   df_nuevos,
+        "pendientes_sin_match": df_pend_sin,
+        "sin_match_e_restante": df_sin_e_rest,
+        "sin_match_s_restante": df_sin_s_rest,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# UTILIDADES INTERNAS
+# ══════════════════════════════════════════════════════════════════════
+
+def _norm_placa(df: pd.DataFrame, col: str) -> pd.Series:
+    """Normaliza placa: mayúsculas, sin espacios, '-' y nulos → ''."""
+    if col not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    return (
+        df[col]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .str.replace("-", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .replace("NAN", "")
+    )
+
+
+def _score_placa(a: str, b: str) -> float:
+    """Score carácter por carácter usando SequenceMatcher (0.0 a 1.0)."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _buscar_mejor(placa_p: str, df_candidatos: pd.DataFrame, idx_usados: set) -> dict | None:
+    """
+    Busca el mejor match de placa_p en df_candidatos.
+    Retorna dict con idx, score y origen, o None si no supera el umbral.
+    """
+    disponibles = df_candidatos[~df_candidatos.index.isin(idx_usados)]
+    if disponibles.empty:
+        return None
+
+    scores = disponibles["_placa_norm"].apply(
+        lambda p: _score_placa(placa_p, p) if p else 0.0
+    )
+
+    mejor_score = scores.max()
+    if mejor_score < UMBRAL_PLACA:
+        return None
+
+    mejor_idx    = scores.idxmax()
+    origen       = "entrada" if "_placa_norm" in df_candidatos.columns and \
+                   "NUMERO_TAG" in df_candidatos.columns else "salida"
+    # Detectar si es entrada (AUSUR) o salida (CSV) por columnas presentes
+    if "NUMERO_TAG" in df_candidatos.columns or "FECHA_HORA" in df_candidatos.columns:
+        origen = "entrada"
+    else:
+        origen = "salida"
+
+    return {
+        "idx":    mejor_idx,
+        "score":  mejor_score,
+        "origen": origen,
+        "fila":   disponibles.loc[mejor_idx],
+    }
+
+
+def _construir_par_placa(pendiente: pd.Series, candidato: dict) -> dict:
+    """Construye el par conciliado por placa con bandera y score."""
+    par = {}
+    fila = candidato["fila"]
+
+    if candidato["origen"] == "entrada":
+        # pendiente es la salida, fila es la entrada
+        for k, v in fila.items():
+            if k != "_placa_norm":
+                par[f"{k}_entrada" if not k.endswith("_entrada") else k] = v
+        for k, v in pendiente.items():
+            if k != "_placa_norm":
+                par[f"{k}_salida" if not k.endswith("_salida") else k] = v
+    else:
+        # pendiente es la entrada, fila es la salida
+        for k, v in pendiente.items():
+            if k != "_placa_norm":
+                par[f"{k}_entrada" if not k.endswith("_entrada") else k] = v
+        for k, v in fila.items():
+            if k != "_placa_norm":
+                par[f"{k}_salida" if not k.endswith("_salida") else k] = v
+
+    par["metodo_match"] = "TAG_EXACTO"   # se sobreescribirá abajo
+    par["metodo_match"] = "PLACA_DIFUSA"
+    par["pct_match_placa"] = f"{candidato['score']:.0%}"
+    par["origen"]          = "PENDIENTE_PLACA"   # ← bandera
+    par["tiempo_recorrido"] = None               # no calculable sin datetime confiable
+
+    # Intentar calcular tiempo si hay datetime en ambos lados
+    dt_e = par.get("datetime_entrada") or par.get("FECHA_HORA_entrada")
+    dt_s = par.get("datetime_salida")  or par.get("Fecha Hora_salida")
+    if dt_e and dt_s:
+        try:
+            total_seg = int((pd.Timestamp(dt_s) - pd.Timestamp(dt_e)).total_seconds())
+            if total_seg > 0:
+                hh = total_seg // 3600
+                mm = (total_seg % 3600) // 60
+                ss = total_seg % 60
+                par["tiempo_recorrido"] = f"{hh:02d}:{mm:02d}:{ss:02d}"
+        except Exception:
+            pass
+
+    return par
+</file>
+
+<file path="matching.py">
+"""
+matching.py — Match entre entradas AUSUR y salidas CSV
+Reglas:
+  - Solo por Tag exacto (todos los estatus 10 tienen Tag)
+  - La salida debe ser POSTERIOR a la entrada
+  - Ventana de tiempo configurable (default 120 min)
+  - Una entrada solo puede matchear con una salida (1 a 1)
+  - Una salida solo puede matchear con una entrada (1 a 1)
+"""
+
+import pandas as pd
+from datetime import timedelta
+from thefuzz import fuzz
+
+from ingesta import XLSX_TAG, CSV_TAG
+
+VENTANA_MAX_MINUTOS = 120
+
+
+def hacer_match(
+    df_entradas: pd.DataFrame,
+    df_salidas:  pd.DataFrame,
+) -> dict:
+
+    entradas = df_entradas.copy()
+    salidas  = df_salidas.copy()
+
+    entradas["datetime"] = pd.to_datetime(entradas["datetime"])
+    salidas["datetime"]  = pd.to_datetime(salidas["datetime"])
+
+    entradas = entradas.sort_values("datetime").reset_index(drop=True)
+    salidas  = salidas.sort_values("datetime")
+
+    # 🔥 OPTIMIZACIÓN CLAVE:
+    # Agrupar salidas por TAG una sola vez
+    salidas_por_tag = {
+        tag: grupo for tag, grupo in salidas.groupby(CSV_TAG, sort=False)
+    }
+
+    resultados = []
+    ids_salidas_usadas = set()
+
+    print(f"\n[MATCH] Entradas: {len(entradas):,} | Salidas: {len(salidas):,}")
+
+    # 🔥 usar itertuples (mucho más rápido que iterrows)
+    for entrada in entradas.itertuples(index=True):
+
+        tag = getattr(entrada, XLSX_TAG)
+        if pd.isna(tag) or str(tag).strip() == "":
+            continue
+
+        if tag not in salidas_por_tag:
+            continue
+
+        candidatas = salidas_por_tag[tag]
+
+        dt_entrada = entrada.datetime
+
+        candidatas = candidatas[
+            (~candidatas.index.isin(ids_salidas_usadas)) &
+            (candidatas["datetime"] > dt_entrada) &
+            (candidatas["datetime"] <= dt_entrada + timedelta(minutes=VENTANA_MAX_MINUTOS))
+        ]
+
+        if candidatas.empty:
+            continue
+
+        mejor_idx = (candidatas["datetime"] - dt_entrada).abs().idxmin()
+        salida = salidas.loc[mejor_idx]
+
+        par = _construir_par(pd.Series(entrada._asdict()), salida)
+        par["_idx_entrada"] = entrada.Index
+
+        resultados.append(par)
+        ids_salidas_usadas.add(mejor_idx)
+
+    df_matched = pd.DataFrame(resultados) if resultados else pd.DataFrame()
+
+    indices_matched = {r["_idx_entrada"] for r in resultados}
+    df_sin_e = entradas[~entradas.index.isin(indices_matched)].copy()
+    df_sin_e["motivo"] = "Sin salida con mismo Tag en ventana de tiempo"
+
+    df_sin_s = salidas[~salidas.index.isin(ids_salidas_usadas)].copy()
+    df_sin_s["motivo"] = "Sin entrada con mismo Tag en ventana de tiempo"
+
+    if not df_matched.empty and "_idx_entrada" in df_matched.columns:
+        df_matched = df_matched.drop(columns=["_idx_entrada"])
+
+    print(f"[MATCH] Conciliados    : {len(df_matched):,}")
+    print(f"[MATCH] Sin match (E)  : {len(df_sin_e):,}")
+    print(f"[MATCH] Sin match (S)  : {len(df_sin_s):,}")
+
+    return {
+        "matched":     df_matched,
+        "sin_match_e": df_sin_e,
+        "sin_match_s": df_sin_s,
+    }
+
+
+def _construir_par(entrada: pd.Series, salida: pd.Series) -> dict:
+    """Une los campos de entrada y salida en un dict, con sufijos claros."""
+    par = {}
+    for k, v in entrada.items():
+        par[f"{k}_entrada" if not k.endswith("_entrada") else k] = v
+    for k, v in salida.items():
+        par[f"{k}_salida" if not k.endswith("_salida") else k] = v
+
+    # Campos calculados
+    dt_e = entrada.get("datetime")
+    dt_s = salida.get("datetime")
+    if pd.notna(dt_e) and pd.notna(dt_s):
+        total_seg = int((pd.Timestamp(dt_s) - pd.Timestamp(dt_e)).total_seconds())
+        hh = total_seg // 3600
+        mm = (total_seg % 3600) // 60
+        ss = total_seg % 60
+        par["tiempo_recorrido"] = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    else:
+        par["tiempo_recorrido"] = None
+
+    par["metodo_match"] = "TAG_EXACTO"
+    return par
+
+def _porcentaje_match_placa(p1: str, p2: str) -> float:
+    if pd.isna(p1) or pd.isna(p2):
+        return 0.0
+    p1 = str(p1).upper().strip()
+    p2 = str(p2).upper().strip()
+    return fuzz.ratio(p1, p2)
+
+
+def match_por_placa(
+    df_sin_e: pd.DataFrame,
+    df_sin_s: pd.DataFrame,
+    df_pendientes: pd.DataFrame,
+    umbral: int = 80
+):
+    """
+    Match optimizado por placa.
+    Reduce complejidad usando indexado por primera letra.
+    """
+
+    from collections import defaultdict
+
+    nuevos_matches = []
+    usados_e = set()
+    usados_s = set()
+
+    candidatos = pd.concat([df_sin_s, df_pendientes], ignore_index=False)
+
+    # 🔥 INDEXAR POR PRIMERA LETRA
+    indice_placas = defaultdict(list)
+
+    for idx, row in candidatos.iterrows():
+        placa = row.get("Placa")
+        if placa is None or pd.isna(placa):
+            placa = row.get("PLACA")
+
+        if placa is None or pd.isna(placa):
+            continue
+
+        placa_str = str(placa).upper().strip()
+        if len(placa_str) == 0:
+            continue
+
+        indice_placas[placa_str[0]].append((idx, placa_str, row))
+
+    print(f"[PLACA] Índice generado con {len(indice_placas)} grupos")
+
+    # 🔥 MATCH INTELIGENTE
+    for idx_e, row_e in df_sin_e.iterrows():
+
+        placa_e = row_e.get("PLACA")
+        if placa_e is None or pd.isna(placa_e):
+            continue
+
+        placa_e_str = str(placa_e).upper().strip()
+        if len(placa_e_str) == 0:
+            continue
+
+        primera_letra = placa_e_str[0]
+
+        if primera_letra not in indice_placas:
+            continue
+
+        mejor_score = 0
+        mejor_idx = None
+        mejor_row = None
+
+        candidatos_filtrados = indice_placas[primera_letra]
+
+        for idx_s, placa_s_str, row_s in candidatos_filtrados:
+
+            if idx_s in usados_s:
+                continue
+
+            # filtro por longitud similar (máx 2 diferencia)
+            if abs(len(placa_s_str) - len(placa_e_str)) > 2:
+                continue
+
+            score = fuzz.partial_ratio(placa_e_str, placa_s_str)
+
+            if score > mejor_score:
+                mejor_score = score
+                mejor_idx = idx_s
+                mejor_row = row_s
+
+        if mejor_score >= umbral and mejor_row is not None:
+
+            par = _construir_par(row_e, mejor_row)
+            par["metodo_match"] = "PLACA_PENDIENTES"
+            par["porcentaje_match_placa"] = mejor_score
+            par["flag_desde_pendientes"] = (
+                mejor_idx in df_pendientes.index
+            )
+
+            nuevos_matches.append(par)
+
+            usados_e.add(idx_e)
+            usados_s.add(mejor_idx)
+
+    df_nuevos = pd.DataFrame(nuevos_matches)
+
+    df_sin_e_rest = df_sin_e.drop(index=usados_e, errors="ignore")
+    df_sin_s_rest = candidatos.drop(index=usados_s, errors="ignore")
+
+    print(f"[PLACA] Nuevos conciliados: {len(df_nuevos)}")
+
+    return df_nuevos, df_sin_e_rest, df_sin_s_rest
+
+
+def XLSX_UUID_COL(df: pd.DataFrame) -> str | None:
+    """Retorna el nombre de la columna UUID en el DataFrame de entradas."""
+    for c in ["UUID", "uuid_entrada", "UUID_entrada"]:
+        if c in df.columns:
+            return c
+    return None
+</file>
+
+<file path="normalizacion.py">
+"""
+FASE 2: Normalización del Día Operativo y Filtro de Estatus
+Resuelve RN-01: El día operativo va de 22:00:00 del día anterior a 21:59:59 del día actual.
+Resuelve RF-C01: Solo procesar transacciones con Estatus "10".
+"""
+
+import pandas as pd
+from datetime import time, timedelta
+
+
+# ─────────────────────────────────────────────
+# Constantes del día operativo (RN-01)
+# ─────────────────────────────────────────────
+HORA_INICIO_DIA_OPERATIVO = 22   # 10:00 PM
+HORA_FIN_DIA_OPERATIVO    = 21   # 9:59:59 PM del día siguiente
+
+ESTATUS_VALIDO = "10"
+
+
+def filtrar_estatus_valido(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    RF-C01: Conservar únicamente registros con Estatus == "10".
+    Retorna (df_validos, df_descartados).
+    """
+    if "estatus" not in df.columns:
+        print("[ADVERTENCIA] No existe columna 'estatus'. Saltando filtro RF-C01.")
+        return df, pd.DataFrame()
+
+    df["estatus"] = df["estatus"].astype(str).str.strip()
+    mask_valido = df["estatus"] == ESTATUS_VALIDO
+
+    df_validos    = df[mask_valido].copy()
+    df_descartado = df[~mask_valido].copy()
+    df_descartado["motivo_rechazo"] = "Estatus distinto de 10"
+
+    print(f"[FILTRO] Con estatus 10: {len(df_validos):,} | Descartados: {len(df_descartado):,}")
+    return df_validos, df_descartado
+
+
+def asignar_dia_operativo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    RN-01: Asigna el 'dia_operativo' correcto a cada transacción.
+
+    Lógica:
+      - Si la hora es >= 22:00  → el día operativo es el día SIGUIENTE (ya inició el nuevo día operativo)
+      - Si la hora es < 22:00   → el día operativo es el día ACTUAL (calendario)
+
+    Ejemplo:
+      23:30 del 5 de enero  → dia_operativo = 6 de enero
+      08:00 del 6 de enero  → dia_operativo = 6 de enero
+      21:59 del 6 de enero  → dia_operativo = 6 de enero  ← cierra el día
+
+    Resultado: columna 'dia_operativo' tipo date.
+    """
+    if "datetime" not in df.columns:
+        raise ValueError("El DataFrame debe tener columna 'datetime' antes de asignar día operativo.")
+
+    df = df.copy()
+
+    # Extraer la hora como número entero para comparar rápido
+    hora = df["datetime"].dt.hour
+
+    # Transacciones nocturnas (>= 22:00) pertenecen al día siguiente
+    df["dia_operativo"] = df["datetime"].dt.date
+    mask_nocturno = hora >= HORA_INICIO_DIA_OPERATIVO
+    df.loc[mask_nocturno, "dia_operativo"] = (
+        df.loc[mask_nocturno, "datetime"] + timedelta(days=1)
+    ).dt.date
+
+    print(f"[NORM] Día operativo asignado. "
+          f"Transacciones nocturnas reasignadas: {mask_nocturno.sum():,}")
+    return df
+
+
+def asignar_decena(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    RN-02: Asigna la decena de facturación según el día del mes del dia_operativo.
+
+    1ª Decena: días 1-10
+    2ª Decena: días 11-20
+    3ª Decena: días 21 en adelante
+    """
+    if "dia_operativo" not in df.columns:
+        raise ValueError("Ejecutar asignar_dia_operativo() antes de asignar_decena().")
+
+    df = df.copy()
+    dia_del_mes = pd.to_datetime(df["dia_operativo"]).dt.day
+
+    condiciones = [
+        dia_del_mes <= 10,
+        (dia_del_mes >= 11) & (dia_del_mes <= 20),
+        dia_del_mes >= 21,
+    ]
+    etiquetas = ["1ra_Decena", "2da_Decena", "3ra_Decena"]
+
+    df["decena"] = pd.cut(
+        dia_del_mes,
+        bins=[0, 10, 20, 31],
+        labels=etiquetas,
+        right=True
+    )
+
+    print(f"[NORM] Distribución por decena:\n{df['decena'].value_counts().to_string()}")
+    return df
+
+
+def separar_entradas_salidas(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Divide el DataFrame en dos: registros de Entrada (E) y de Salida (S).
+    Necesario para la Fase 3 de matching.
+    """
+    if "sentido" not in df.columns:
+        raise ValueError("Se requiere columna 'sentido' con valores 'E' o 'S'.")
+
+    df_entradas = df[df["sentido"] == "E"].copy().reset_index(drop=True)
+    df_salidas  = df[df["sentido"] == "S"].copy().reset_index(drop=True)
+
+    print(f"[NORM] Entradas: {len(df_entradas):,} | Salidas (AUSUR): {len(df_salidas):,}")
+    return df_entradas, df_salidas
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "vet-module"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0.2",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "pandas-stubs~=2.3.3",
+    "python-levenshtein>=0.27.1",
+    "streamlit>=1.50.0",
+    "thefuzz>=0.22.1",
+]
+</file>
+
+<file path="tarifas.py">
+"""
+FASE 5: Cálculo de Tarifas y Validaciones de Negocio
+RF-C04: Tarifa según tramo recorrido y clase del vehículo.
+RF-C05: Vigencias de Tag y descuentos a beneficiarios.
+"""
+
+import pandas as pd
+from datetime import date
+
+
+# ─────────────────────────────────────────────
+# Ejemplo de matriz tarifaria (reemplaza con tu data real)
+# Estructura: {(tramo, clase): importe}
+# Tramo = combinación "caseta_entrada-caseta_salida"
+# Clase = clasificación vehicular (1=Auto, 2=Moto, 3=Bus, 4=Camión, etc.)
+# ─────────────────────────────────────────────
+MATRIZ_TARIFAS: dict[tuple, float] = {
+    ("NORTE-SUR", "1"): 85.00,
+    ("NORTE-SUR", "2"): 45.00,
+    ("NORTE-SUR", "3"): 165.00,
+    ("NORTE-SUR", "4"): 210.00,
+    ("SUR-NORTE", "1"): 85.00,
+    ("SUR-NORTE", "2"): 45.00,
+    ("SUR-NORTE", "3"): 165.00,
+    ("SUR-NORTE", "4"): 210.00,
+    # Agrega todos tus tramos aquí...
+}
+
+# Porcentaje de descuento para beneficiarios (residentes, etc.)
+DESCUENTO_BENEFICIARIO = 0.50   # 50%
+
+
+def calcular_tarifa(df_matched: pd.DataFrame, matriz_tarifas: dict = None) -> pd.DataFrame:
+    """
+    RF-C04: Determina la tarifa para cada par Entrada-Salida según
+    el tramo recorrido y la clase validada del vehículo.
+
+    Requiere columnas en df_matched:
+        - caseta_entrada  (o similar, que identifique el punto de entrada)
+        - caseta_salida
+        - clase_entrada o clase_salida (clase del vehículo)
+    """
+    if df_matched.empty:
+        return df_matched
+
+    df = df_matched.copy()
+    tarifas = matriz_tarifas or MATRIZ_TARIFAS
+
+    # ── 1. Construir el identificador del tramo ────────────────────────
+    # Ajusta los nombres de columna a los de tu CLR real
+    col_caseta_e = _buscar_columna(df, ["caseta_entrada", "plaza_entrada", "punto_entrada"])
+    col_caseta_s = _buscar_columna(df, ["caseta_salida",  "plaza_salida",  "punto_salida"])
+    col_clase    = _buscar_columna(df, ["clase_entrada", "clase_salida", "clase"])
+
+    if not col_caseta_e or not col_caseta_s:
+        print("[TARIFAS] ADVERTENCIA: No se encontraron columnas de caseta. "
+              "Verificar nombres de columnas.")
+        df["tramo"] = "DESCONOCIDO"
+    else:
+        df["tramo"] = df[col_caseta_e].str.upper() + "-" + df[col_caseta_s].str.upper()
+
+    df["clase_normalizada"] = df[col_clase].astype(str).str.strip() if col_clase else "1"
+
+    # ── 2. Lookup en la matriz tarifaria ──────────────────────────────
+    df["tarifa_calculada"] = df.apply(
+        lambda row: tarifas.get(
+            (row["tramo"], row["clase_normalizada"]),
+            None   # None = tramo/clase no encontrado en la matriz
+        ),
+        axis=1
+    )
+
+    # Alertar sobre tramos sin tarifa
+    sin_tarifa = df["tarifa_calculada"].isna().sum()
+    if sin_tarifa > 0:
+        print(f"[TARIFAS] ALERTA: {sin_tarifa:,} registros sin tarifa definida "
+              f"(tramo/clase no encontrado en la matriz).")
+        # Los marcaremos pero NO los rechazamos, necesitan revisión
+        df.loc[df["tarifa_calculada"].isna(), "alerta_tarifa"] = "SIN_TARIFA_EN_MATRIZ"
+
+    print(f"[TARIFAS] Tarifas calculadas: {df['tarifa_calculada'].notna().sum():,}")
+    return df
+
+
+def aplicar_descuentos_vigencias(
+    df: pd.DataFrame,
+    df_tags_beneficiarios: pd.DataFrame = None,
+    df_vigencias_tags: pd.DataFrame = None
+) -> pd.DataFrame:
+    """
+    RF-C05: Aplica descuentos si el Tag pertenece a beneficiarios
+    y valida que el Tag esté vigente a la fecha de la transacción.
+
+    Args:
+        df                    : DataFrame con pares matched y tarifas calculadas.
+        df_tags_beneficiarios : DataFrame con columna 'tag' de beneficiarios.
+                                Si es None, no se aplican descuentos.
+        df_vigencias_tags     : DataFrame con columnas ['tag', 'fecha_inicio', 'fecha_fin'].
+                                Si es None, no se validan vigencias.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["descuento_aplicado"] = 0.0
+    df["tarifa_final"] = df["tarifa_calculada"]
+    df["tag_vigente"] = True
+    df["es_beneficiario"] = False
+
+    # ── Validar vigencia del Tag ───────────────────────────────────────
+    if df_vigencias_tags is not None and "tag_entrada" in df.columns:
+        df_vigencias_tags = df_vigencias_tags.copy()
+        df_vigencias_tags["tag"] = df_vigencias_tags["tag"].str.upper()
+        df_vigencias_tags["fecha_inicio"] = pd.to_datetime(df_vigencias_tags["fecha_inicio"]).dt.date
+        df_vigencias_tags["fecha_fin"]    = pd.to_datetime(df_vigencias_tags["fecha_fin"]).dt.date
+
+        # Merge para obtener vigencia de cada tag
+        df = df.merge(
+            df_vigencias_tags.rename(columns={
+                "tag": "tag_entrada",
+                "fecha_inicio": "vig_inicio",
+                "fecha_fin": "vig_fin"
+            }),
+            on="tag_entrada",
+            how="left"
+        )
+
+        # Verificar que la fecha de transacción esté dentro de la vigencia
+        fecha_tx = pd.to_datetime(df["dia_operativo_entrada"]).dt.date
+        df["tag_vigente"] = (
+            (fecha_tx >= df["vig_inicio"]) & (fecha_tx <= df["vig_fin"])
+        ).fillna(True)  # Si no hay registro de vigencia, asumir vigente (para no bloquear)
+
+        n_vencidos = (~df["tag_vigente"]).sum()
+        if n_vencidos > 0:
+            print(f"[TARIFAS] Tags vencidos detectados: {n_vencidos:,}")
+
+    # ── Aplicar descuentos a beneficiarios ────────────────────────────
+    if df_tags_beneficiarios is not None and "tag_entrada" in df.columns:
+        tags_benef = set(
+            df_tags_beneficiarios["tag"].str.upper().dropna().unique()
+        )
+        df["es_beneficiario"] = df["tag_entrada"].isin(tags_benef)
+
+        # Solo aplica descuento si el tag ESTÁ vigente y ES beneficiario
+        mask_descuento = df["es_beneficiario"] & df["tag_vigente"]
+        df.loc[mask_descuento, "descuento_aplicado"] = DESCUENTO_BENEFICIARIO
+        df.loc[mask_descuento, "tarifa_final"] = (
+            df.loc[mask_descuento, "tarifa_calculada"] * (1 - DESCUENTO_BENEFICIARIO)
+        )
+
+        print(f"[TARIFAS] Beneficiarios con descuento aplicado: {mask_descuento.sum():,}")
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# UTILIDADES
+# ─────────────────────────────────────────────
+
+def _buscar_columna(df: pd.DataFrame, candidatos: list) -> str | None:
+    """Busca la primera columna que exista en el DataFrame de una lista de candidatos."""
+    for c in candidatos:
+        if c in df.columns:
+            return c
+    return None
+
+
+def cargar_matriz_desde_excel(ruta: str) -> dict:
+    """
+    Carga la matriz tarifaria desde un Excel con columnas:
+    [tramo, clase, tarifa]
+    """
+    df_tarifas = pd.read_excel(ruta, dtype=str)
+    df_tarifas["tarifa"] = pd.to_numeric(df_tarifas["tarifa"], errors="coerce")
+    return {
+        (row["tramo"].upper(), row["clase"].strip()): row["tarifa"]
+        for _, row in df_tarifas.iterrows()
+        if pd.notna(row["tarifa"])
+    }
+</file>
+
+</files>
