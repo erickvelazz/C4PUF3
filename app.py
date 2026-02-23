@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ingesta     import leer_xlsx_ausur, leer_csv_salidas, limpiar_ausur, preparar_salidas_csv
-from matching    import hacer_match
+from matching    import hacer_match, match_por_hora
 from match_placa import match_por_placa, UMBRAL_PLACA
 import matching as _m
 
@@ -53,7 +53,8 @@ hr{border-color:#30363d!important;margin:20px 0!important}
 DEFAULTS = {
     "run":         False,
     "matched":     pd.DataFrame(),   # conciliados por Tag
-    "nuevos":      pd.DataFrame(),   # conciliados por Placa (origen=PENDIENTE_PLACA)
+    "nuevos":      pd.DataFrame(),   # conciliados por Placa
+    "validacion":  pd.DataFrame(),   # requieren validación en cámara
     "duplicados":  pd.DataFrame(),   # duplicados AUSUR
     "sin_e":       pd.DataFrame(),   # entradas sin match final
     "sin_s":       pd.DataFrame(),   # salidas sin match final
@@ -115,11 +116,17 @@ def tmp(f):
 def generar_xls():
     s   = st.session_state
     buf = io.BytesIO()
-    # Unir matched + nuevos en una sola hoja Conciliados
-    df_todos = pd.concat([s.matched, s.nuevos], ignore_index=True)
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+    # Usar xlsxwriter si está disponible (5x más rápido), openpyxl como fallback
+    try:
+        engine = "xlsxwriter"
+        import xlsxwriter as _  # noqa
+    except ImportError:
+        engine = "openpyxl"
+    with pd.ExcelWriter(buf, engine=engine) as w:
         for df, sheet in [
-            (df_todos,      "Conciliados"),
+            (s.matched,     "Conciliados_Tag"),
+            (s.nuevos,      "Conciliados_Placa"),
+            (s.validacion,  "Requieren_Validacion"),
             (s.duplicados,  "Duplicados_AUSUR"),
             (s.sin_e,       "Sin_Match_Entradas"),
             (s.sin_s,       "Sin_Match_Salidas"),
@@ -185,8 +192,8 @@ if boton and listos:
             res_p       = match_por_placa(df_pend, df_se, df_ss)
             df_nuevos   = res_p["nuevos_conciliados"]
             df_pend_sin = res_p["pendientes_sin_match"]
-            df_se2      = res_p["sin_match_e_restante"]
-            df_ss2      = res_p["sin_match_s_restante"]
+            df_se2      = res_p["sin_match_e_final"]
+            df_ss2      = res_p["sin_match_s_final"]
             log(f"Por placa: {len(df_nuevos):,} | Pendientes sin match: {len(df_pend_sin):,}",
                 "warn" if len(df_pend_sin) > 0 else "ok")
 
@@ -197,6 +204,7 @@ if boton and listos:
             # Guardar en session state
             st.session_state.matched     = df_m
             st.session_state.nuevos      = df_nuevos
+            # st.session_state.validacion  = df_val
             st.session_state.duplicados  = df_dup
             st.session_state.sin_e       = df_se2
             st.session_state.sin_s       = df_ss2
@@ -225,13 +233,14 @@ else:
     pct      = total / max(total + len(s.sin_e), 1) * 100
 
     # ── Métricas ──────────────────────────────────────────────────────
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     card(c1, "cg", f"{total:,}",            "Conciliados total")
     card(c2, "cg", f"{len(s.matched):,}",   "· Por Tag")
     card(c3, "cp", f"{len(s.nuevos):,}",    "· Por Placa")
     card(c4, "cy", f"{len(s.sin_e):,}",     "Sin match (E)")
     card(c5, "cr", f"{len(s.duplicados):,}","Duplicados AUSUR")
-    card(c6, "cb", f"{pct:.1f}%",           "Tasa conciliación")
+    card(c6, "cy", f"{len(s.validacion):,}","Validación cámara")
+    card(c7, "cb", f"{pct:.1f}%",           "Tasa conciliación")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -247,12 +256,13 @@ else:
     st.markdown("---")
 
     # ── Tabs ──────────────────────────────────────────────────────────
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
         f"✅ Tag ({len(s.matched):,})",
         f"🔤 Placa ({len(s.nuevos):,})",
         f"🔍 Duplicados AUSUR ({len(s.duplicados):,})",
         f"⚠️ Sin Match ({len(s.sin_e)+len(s.sin_s):,})",
         f"🕐 Pendientes sin match ({len(s.pend_sin):,})",
+        f"📹 Validación cámara ({len(s.validacion):,})",
         f"🗑️ Descartados ({len(s.descartados):,})",
         "🖥 Log",
     ])
@@ -326,8 +336,26 @@ else:
             st.warning(f"{len(s.pend_sin):,} pendientes (status 4/8) sin placa con score ≥ {umbral_placa}%. Revisión manual.")
             st.dataframe(s.pend_sin, use_container_width=True, hide_index=True, height=380)
 
-    # Tab 6 — Descartados
+    # Tab 6 — Validación cámara
     with t6:
+        if s.validacion.empty:
+            st.success("No hay matches que requieran validación en cámara.")
+        else:
+            st.warning(f"{len(s.validacion):,} registros matcheados SOLO por hora (sin Tag ni Placa). Validar en cámara.")
+            st.caption("Estos registros tienen alta probabilidad de ser el mismo cruce pero requieren confirmación visual.")
+            if "tiempo_recorrido_min" in s.validacion.columns:
+                st.markdown('<p class="slbl">Distribución de tiempos de recorrido</p>', unsafe_allow_html=True)
+                tiempos = s.validacion["tiempo_recorrido_min"].dropna()
+                c_a, c_b = st.columns(2)
+                with c_a:
+                    st.markdown(f'<div class="card cy"><div class="v">{tiempos.mean():.1f} min</div><div class="l">Tiempo promedio</div></div>', unsafe_allow_html=True)
+                with c_b:
+                    st.markdown(f'<div class="card cy"><div class="v">{tiempos.max():.1f} min</div><div class="l">Tiempo máximo</div></div>', unsafe_allow_html=True)
+                st.markdown("---")
+            st.dataframe(s.validacion, use_container_width=True, hide_index=True, height=380)
+
+    # Tab 7 — Descartados
+    with t7:
         if s.descartados.empty:
             st.success("Sin descartados del CSV.")
         else:
@@ -338,8 +366,8 @@ else:
                 st.markdown("---")
             st.dataframe(s.descartados, use_container_width=True, hide_index=True, height=320)
 
-    # Tab 7 — Log
-    with t7:
+    # Tab 8 — Log
+    with t8:
         st.markdown('<p class="slbl">Log de ejecución</p>', unsafe_allow_html=True)
         html = "<br>".join(s.logs) if s.logs else "Sin logs."
         st.markdown(f'<div class="log">{html}</div>', unsafe_allow_html=True)
