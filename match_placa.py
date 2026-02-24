@@ -51,53 +51,76 @@ def match_por_placa(
     idx_s_usados = set() # Se mantiene para compatibilidad de retorno, pero no se usa en búsqueda
     idx_pend_sin = []
 
+    stats = {
+        "total_procesados": 0,
+        "match_exitoso": 0,
+        "rechazados": 0,
+        "duplicados_detectados": 0,
+        "resuelto_por_placa": 0,
+        "resuelto_por_tiempo": 0,
+        "resuelto_unico": 0,
+        "detalle_rechazos": {}
+    }
+
     print(f"\n[MATCH PLACA] Pendientes (B): {len(pend):,} | Candidatos Entradas (A): {len(sin_e):,}")
 
     for idx_p, pendiente in pend.iterrows():
+        stats["total_procesados"] += 1
+        
         # ── VALIDACIÓN DIRECCIONALIDAD A-B ─────────────────────────────
         # El pendiente debe ser SALIDA (B) para buscar en ENTRADA (A).
-        # Si por alguna razón llega un registro que no es B, se salta o se maneja.
-        # Asumimos que ingesta.py ya filtró, pero validamos campo Cuerpo si existe.
         cuerpo_p = pendiente.get("Cuerpo")
         if cuerpo_p and cuerpo_p != "B":
-            # Si no es B, no debería estar aquí según la lógica actual (pendientes vienen de Salidas)
-            # O si es A, debería buscar en Salidas, pero el flujo actual es Salidas -> Entradas.
-            print(f"[MATCH PLACA] IGNORADO: Pendiente con Cuerpo '{cuerpo_p}' (se esperaba B)")
             idx_pend_sin.append(idx_p)
+            motivo = f"Direccionalidad incorrecta: Pendiente es {cuerpo_p}"
+            stats["detalle_rechazos"][motivo] = stats["detalle_rechazos"].get(motivo, 0) + 1
             continue
 
         placa_p = pendiente.get("_placa_norm", "")
 
         if not placa_p or placa_p == "-":
             idx_pend_sin.append(idx_p)
+            motivo = "Sin información de placa"
+            stats["detalle_rechazos"][motivo] = stats["detalle_rechazos"].get(motivo, 0) + 1
             continue
 
         # Solo buscamos en sin_e (Entradas - A)
-        # Nunca buscamos en sin_s (Salidas - B) para evitar match B-B
-        mejor_e = _buscar_mejor_placa(
+        res_match = _buscar_mejor_placa(
             placa_p, sin_e, idx_e_usados,
             dt_ref=pendiente.get("datetime"), es_entrada=True
         )
 
-        candidato = mejor_e
-
-        if candidato:
+        if res_match:
+            candidato = res_match
             # Validación final de direccionalidad antes de aceptar
-            cuerpo_c = candidato["fila"].get("Cuerpo", "A") # Asumimos A para sin_e si no tiene campo
+            cuerpo_c = candidato["fila"].get("Cuerpo", "A") 
             
-            # Match válido solo si son opuestos (A vs B)
-            # Como sabemos que pendiente es B (o asumimos), candidato debe ser A.
             if cuerpo_c == "B":
-                 # Error: Match B-B detectado
-                 print(f"[MATCH PLACA] RECHAZADO: Candidato es Cuerpo B (Salida) para Pendiente {placa_p}")
                  idx_pend_sin.append(idx_p)
+                 motivo = "Direccionalidad incorrecta: Candidato es Salida (B)"
+                 stats["detalle_rechazos"][motivo] = stats["detalle_rechazos"].get(motivo, 0) + 1
                  continue
 
             par = _construir_par_placa(pendiente, candidato)
             nuevos.append(par)
             idx_e_usados.add(candidato["idx"])
+            stats["match_exitoso"] += 1
+            
+            # Actualizar estadísticas de resolución
+            metodo = candidato.get("metodo_resolucion", "Unico")
+            if "Prioridad Placa" in metodo:
+                stats["resuelto_por_placa"] += 1
+                stats["duplicados_detectados"] += 1
+            elif "Cercanía Temporal" in metodo and "Duplicado" in metodo:
+                stats["resuelto_por_tiempo"] += 1
+                stats["duplicados_detectados"] += 1
+            else:
+                stats["resuelto_unico"] += 1
+
         else:
             idx_pend_sin.append(idx_p)
+            motivo = "Sin coincidencia (Score < 75% o fuera de tiempo)"
+            stats["detalle_rechazos"][motivo] = stats["detalle_rechazos"].get(motivo, 0) + 1
 
     df_nuevos     = pd.DataFrame(nuevos) if nuevos else pd.DataFrame()
     df_pend_sin   = pend.loc[idx_pend_sin].drop(columns=["_placa_norm"], errors="ignore").copy()
@@ -115,6 +138,7 @@ def match_por_placa(
         "pendientes_sin_match": df_pend_sin,
         "sin_match_e_final":    df_sin_e_rest,
         "sin_match_s_final":    df_sin_s_rest,
+        "stats":                stats
     }
 
 
@@ -173,15 +197,97 @@ def _buscar_mejor_placa(placa_p: str, df_candidatos: pd.DataFrame,
     mejor_score = scores.max()
     if mejor_score < UMBRAL_PLACA:
         return None
+    
+    # 1. Valid candidates
+    candidatos_validos = disponibles[scores >= UMBRAL_PLACA].copy()
+    candidatos_validos["_score"] = scores[scores >= UMBRAL_PLACA]
+    
+    if candidatos_validos.empty:
+        return None
 
-    mejor_idx = scores.idxmax()
+    # Calculate time diff for all (Referencia vs Candidato)
+    dt_ref_ts = pd.Timestamp(dt_ref)
+    candidatos_validos["_diff_abs"] = (candidatos_validos["datetime"] - dt_ref_ts).abs()
+    
+    # 2. Sort by Score (Desc) then Time Diff (Asc) to find the "Default Best"
+    # Esto prioriza Score alto y luego cercanía a la referencia
+    candidatos_validos = candidatos_validos.sort_values(
+        by=["_score", "_diff_abs"], 
+        ascending=[False, True]
+    )
+    
+    best_candidate = candidatos_validos.iloc[0]
+    best_idx = candidatos_validos.index[0]
+    top_score = best_candidate["_score"]
+    
+    # 3. Detect duplicates within 15s of the Best Candidate
+    # Definición de duplicado: Score idéntico (o top) Y tiempo dentro de ±15s del mejor candidato
+    
+    # Primero filtramos por score (solo los top)
+    score_ties = candidatos_validos[candidatos_validos["_score"] == top_score].copy()
+    
+    # Filtrar los que están en la ventana de 15s del MEJOR candidato
+    best_time = best_candidate["datetime"]
+    
+    def is_within_15s(row):
+        delta = abs(row["datetime"] - best_time)
+        return delta.total_seconds() <= 15
+        
+    duplicates_in_window = score_ties[score_ties.apply(is_within_15s, axis=1)]
+    
     origen = "entrada" if "NUMERO_TAG" in df_candidatos.columns else "salida"
 
+    if len(duplicates_in_window) == 1:
+        # No hay duplicados en conflicto (solo el ganador)
+        return {
+            "idx":    best_idx,
+            "score":  top_score,
+            "origen": origen,
+            "fila":   best_candidate,
+            "metodo_resolucion": "Unico (Mejor Score/Tiempo)"
+        }
+        
+    # 4. Resolver conflicto de duplicados
+    # Regla 1: Prioridad Placa Registrada
+    col_placa_orig = PLACA_XLSX if "NUMERO_TAG" in df_candidatos.columns else PLACA_CSV
+    
+    def tiene_placa_valida(row):
+        val = str(row.get(col_placa_orig, "")).strip()
+        return val and val not in ["-", "nan", "NaN", "NULL", ""]
+        
+    duplicates_in_window["_tiene_placa"] = duplicates_in_window.apply(tiene_placa_valida, axis=1)
+    
+    con_placa = duplicates_in_window[duplicates_in_window["_tiene_placa"]]
+    
+    metodo_res = ""
+    pool_final = duplicates_in_window
+    
+    if not con_placa.empty and len(con_placa) < len(duplicates_in_window):
+        # Algunos tienen placa y otros no -> Ganan los que tienen placa
+        pool_final = con_placa
+        metodo_res = "Prioridad Placa"
+    else:
+        # Todos tienen o ninguno tiene -> Decidimos por cercanía
+        metodo_res = "Cercanía Temporal"
+        
+    # Regla 2: Cercanía Geográfica (Tiempo)
+    # Ordenamos el pool final por cercanía a la REFERENCIA (dt_ref)
+    pool_final = pool_final.sort_values("_diff_abs", ascending=True)
+    
+    ganador_idx = pool_final.index[0]
+    ganador_row = pool_final.loc[ganador_idx]
+    
+    if metodo_res == "Prioridad Placa":
+        metodo_res += " + Cercanía"
+    else:
+        metodo_res += " (Duplicado Resuelto)"
+        
     return {
-        "idx":    mejor_idx,
-        "score":  mejor_score,
+        "idx":    ganador_idx,
+        "score":  ganador_row["_score"],
         "origen": origen,
-        "fila":   disponibles.loc[mejor_idx],
+        "fila":   ganador_row,
+        "metodo_resolucion": metodo_res
     }
 
 
@@ -225,6 +331,10 @@ def _construir_par_placa(pendiente: pd.Series, candidato: dict) -> dict:
     par["metodo_match"]    = "PLACA_DIFUSA"
     par["pct_match_placa"] = f"{candidato['score']:.0%}"
     par["origen"]          = "PENDIENTE_PLACA"
+
+    # NUEVO: Registrar método de resolución de duplicados si existe
+    if "metodo_resolucion" in candidato:
+        par["metodo_resolucion"] = candidato["metodo_resolucion"]
     
     # Calcular tiempo de recorrido
     dt_e = par.get("datetime_entrada") or par.get("FECHA_HORA_entrada")

@@ -61,6 +61,8 @@ DEFAULTS = {
     "pend_sin":    pd.DataFrame(),   # pendientes que no matchearon por placa
     "descartados": pd.DataFrame(),   # resto de descartados CSV
     "xls":         None,
+    "xls_name":    None,
+    "stats_placa": {},
     "logs":        [],
 }
 for k, v in DEFAULTS.items():
@@ -122,7 +124,61 @@ def generar_xls():
         import xlsxwriter as _  # noqa
     except ImportError:
         engine = "openpyxl"
+    
+    # ── Construir DataFrame de Reporte Resumido ──
+    reporte_rows = []
+    
+    # 1. Matches por Método
+    reporte_rows.append({"Concepto": "MATCHES POR MÉTODO", "Detalle": "", "Cantidad": ""})
+    if not s.matched.empty:
+        reporte_rows.append({"Concepto": "", "Detalle": "Tag Exacto (Id 10)", "Cantidad": len(s.matched)})
+    if not s.nuevos.empty:
+        reporte_rows.append({"Concepto": "", "Detalle": "Placa Difusa (Id 8)", "Cantidad": len(s.nuevos)})
+    if not s.validacion.empty:
+        reporte_rows.append({"Concepto": "", "Detalle": "Validación Manual", "Cantidad": len(s.validacion)})
+    total_m = len(s.matched) + len(s.nuevos) + len(s.validacion)
+    reporte_rows.append({"Concepto": "", "Detalle": "TOTAL MATCHES", "Cantidad": total_m})
+    reporte_rows.append({"Concepto": "", "Detalle": "", "Cantidad": ""}) # Espacio
+
+    # 2. Rechazos
+    reporte_rows.append({"Concepto": "REGISTROS RECHAZADOS", "Detalle": "", "Cantidad": ""})
+    
+    # Rechazos detallados (match placa)
+    stats = s.stats_placa
+    if stats and "detalle_rechazos" in stats:
+        for motivo, count in stats["detalle_rechazos"].items():
+            reporte_rows.append({"Concepto": "", "Detalle": motivo, "Cantidad": count})
+    elif not s.pend_sin.empty:
+        reporte_rows.append({"Concepto": "", "Detalle": "Pendientes sin match (Id 8)", "Cantidad": len(s.pend_sin)})
+        
+    # Descartados CSV
+    if not s.descartados.empty:
+        if "Clasificacion" in s.descartados.columns:
+            for motivo, count in s.descartados["Clasificacion"].value_counts().items():
+                reporte_rows.append({"Concepto": "", "Detalle": f"Descartado: {motivo}", "Cantidad": count})
+        else:
+            reporte_rows.append({"Concepto": "", "Detalle": "Descartados CSV (Id 4, 6, 7)", "Cantidad": len(s.descartados)})
+            
+    # Duplicados AUSUR
+    if not s.duplicados.empty:
+        reporte_rows.append({"Concepto": "", "Detalle": "Duplicados AUSUR (Tag repetido ≤10s)", "Cantidad": len(s.duplicados)})
+    reporte_rows.append({"Concepto": "", "Detalle": "", "Cantidad": ""}) # Espacio
+
+    # 3. Resolución de Duplicados
+    if stats and stats.get("duplicados_detectados", 0) > 0:
+        reporte_rows.append({"Concepto": "RESOLUCIÓN DUPLICADOS (PLACA)", "Detalle": "", "Cantidad": ""})
+        reporte_rows.append({"Concepto": "", "Detalle": "Conflictos Detectados", "Cantidad": stats.get("duplicados_detectados", 0)})
+        reporte_rows.append({"Concepto": "", "Detalle": "Resueltos por Placa", "Cantidad": stats.get("resuelto_por_placa", 0)})
+        reporte_rows.append({"Concepto": "", "Detalle": "Resueltos por Tiempo", "Cantidad": stats.get("resuelto_por_tiempo", 0)})
+    
+    df_reporte = pd.DataFrame(reporte_rows)
+
     with pd.ExcelWriter(buf, engine=engine) as w:
+        # Escribir Reporte primero (o al final, según preferencia. Usualmente resumen va primero o ultimo)
+        # El usuario pidió "una pestaña de excel", la pondremos al final o principio.
+        # Pondré al final para no alterar orden existente si están acostumbrados, o principio si es resumen.
+        # Lo pondré al final como Tab 8 en UI.
+        
         for df, sheet in [
             (s.matched,     "Conciliados_Tag"),
             (s.nuevos,      "Conciliados_Placa"),
@@ -135,6 +191,11 @@ def generar_xls():
         ]:
             if not df.empty:
                 df.to_excel(w, sheet_name=sheet, index=False)
+        
+        # Agregar hoja de reporte
+        if not df_reporte.empty:
+            df_reporte.to_excel(w, sheet_name="Reporte_Operaciones", index=False)
+            
     buf.seek(0)
     return buf.getvalue()
 
@@ -194,6 +255,7 @@ if boton and listos:
             df_pend_sin = res_p["pendientes_sin_match"]
             df_se2      = res_p["sin_match_e_final"]
             df_ss2      = res_p["sin_match_s_final"]
+            stats_p     = res_p.get("stats", {})
             log(f"Por placa: {len(df_nuevos):,} | Pendientes sin match: {len(df_pend_sin):,}",
                 "warn" if len(df_pend_sin) > 0 else "ok")
 
@@ -210,7 +272,9 @@ if boton and listos:
             st.session_state.sin_s       = df_ss2
             st.session_state.pend_sin    = df_pend_sin
             st.session_state.descartados = df_desc
+            st.session_state.stats_placa = stats_p
             st.session_state.xls         = generar_xls()
+            st.session_state.xls_name    = f"VET_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
             st.session_state.run         = True
             log("Pipeline completado.")
 
@@ -247,16 +311,18 @@ else:
     # ── Descarga ──────────────────────────────────────────────────────
     cd, _ = st.columns([2, 6])
     with cd:
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        fname = s.xls_name if s.xls_name else f"VET_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button("⬇  DESCARGAR EXCEL", data=s.xls,
-            file_name=f"VET_{ts}.xlsx",
+            file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_btn_{fname}",
             use_container_width=True)
+        st.caption("Nota: Si la descarga no inicia, verifique si su navegador bloqueó contenido inseguro (icono en la barra de direcciones).")
 
     st.markdown("---")
 
     # ── Tabs ──────────────────────────────────────────────────────────
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([
         f"✅ Tag ({len(s.matched):,})",
         f"🔤 Placa ({len(s.nuevos):,})",
         f"🔍 Duplicados AUSUR ({len(s.duplicados):,})",
@@ -264,6 +330,7 @@ else:
         f"🕐 Pendientes sin match ({len(s.pend_sin):,})",
         f"📹 Validación cámara ({len(s.validacion):,})",
         f"🗑️ Descartados ({len(s.descartados):,})",
+        "📊 Reporte",
         "🖥 Log",
     ])
 
@@ -275,8 +342,12 @@ else:
             if "datetime_entrada" in s.matched.columns:
                 st.markdown('<p class="slbl">Cruces por hora del día</p>', unsafe_allow_html=True)
                 df_h = s.matched.copy()
-                df_h["hora"] = pd.to_datetime(df_h["datetime_entrada"]).dt.hour
-                st.bar_chart(df_h["hora"].value_counts().sort_index(), color="#f78166")
+                df_h["hora"] = pd.to_datetime(df_h["datetime_entrada"], errors='coerce').dt.hour
+                counts = df_h["hora"].dropna().value_counts().sort_index()
+                if not counts.empty:
+                    st.bar_chart(counts, color="#f78166")
+                else:
+                    st.info("Sin datos de hora para graficar.")
                 st.markdown("---")
             st.dataframe(s.matched, use_container_width=True, hide_index=True, height=400)
 
@@ -366,8 +437,91 @@ else:
                 st.markdown("---")
             st.dataframe(s.descartados, use_container_width=True, hide_index=True, height=320)
 
-    # Tab 8 — Log
+    # Tab 8 — Reporte Resumido
     with t8:
+        st.markdown('<p class="slbl">Resumen de Operaciones</p>', unsafe_allow_html=True)
+        
+        # 1. Total matches por método
+        st.subheader("1. Total de Matches por Método")
+        matches_data = []
+        if not s.matched.empty:
+            matches_data.append({"Método": "Tag Exacto (Id 10)", "Cantidad": len(s.matched)})
+        if not s.nuevos.empty:
+            matches_data.append({"Método": "Placa Difusa (Id 8)", "Cantidad": len(s.nuevos)})
+        if not s.validacion.empty:
+            matches_data.append({"Método": "Validación Manual", "Cantidad": len(s.validacion)})
+            
+        df_matches = pd.DataFrame(matches_data)
+        if not df_matches.empty:
+            # Calcular total
+            total_matches = df_matches["Cantidad"].sum()
+            df_matches.loc[len(df_matches)] = {"Método": "TOTAL", "Cantidad": total_matches}
+            st.table(df_matches)
+        else:
+            st.info("No se realizaron matches.")
+            
+        # 2. Registros Rechazados (Agrupados)
+        st.subheader("2. Registros Rechazados")
+        rechazos_list = []
+        
+        # Usar estadísticas detalladas de match_placa si existen
+        stats = s.stats_placa
+        if stats and "detalle_rechazos" in stats:
+            for motivo, count in stats["detalle_rechazos"].items():
+                rechazos_list.append({"Razón": motivo, "Cantidad": count})
+        else:
+             # Fallback a s.pend_sin si no hay stats
+             if not s.pend_sin.empty:
+                 rechazos_list.append({"Razón": "Pendientes sin match (Id 8)", "Cantidad": len(s.pend_sin)})
+
+        # Descartados CSV (Id 4, 6, 7, etc)
+        if not s.descartados.empty:
+            if "Clasificacion" in s.descartados.columns:
+                motivos_desc = s.descartados["Clasificacion"].value_counts().reset_index()
+                motivos_desc.columns = ["Razón", "Cantidad"]
+                rechazos_list.extend(motivos_desc.to_dict('records'))
+            else:
+                rechazos_list.append({"Razón": "Descartados CSV (Id 4, 6, 7, etc)", "Cantidad": len(s.descartados)})
+
+        # Duplicados AUSUR
+        if not s.duplicados.empty:
+             rechazos_list.append({"Razón": "Duplicados AUSUR (Tag repetido ≤10s)", "Cantidad": len(s.duplicados)})
+
+        if rechazos_list:
+            df_rechazos = pd.DataFrame(rechazos_list)
+            # Agrupar por razón para asegurar unicidad
+            df_rechazos = df_rechazos.groupby("Razón", as_index=False)["Cantidad"].sum()
+            st.table(df_rechazos)
+        else:
+            st.success("No hubo rechazos significativos.")
+
+        # 3. Resolución de Duplicados
+        st.subheader("3. Resolución de Duplicados (Match Placa)")
+        
+        stats = s.stats_placa
+        hay_duplicados = False
+        
+        if stats and stats.get("duplicados_detectados", 0) > 0:
+            dup_data = [
+                {"Método Resolución": "Prioridad Placa", "Cantidad": stats.get("resuelto_por_placa", 0)},
+                {"Método Resolución": "Cercanía Temporal", "Cantidad": stats.get("resuelto_por_tiempo", 0)},
+                {"Método Resolución": "Total Conflictos Resueltos", "Cantidad": stats.get("duplicados_detectados", 0)},
+            ]
+            st.table(pd.DataFrame(dup_data))
+            hay_duplicados = True
+        elif not s.nuevos.empty and "metodo_resolucion" in s.nuevos.columns:
+             # Fallback si no tenemos stats pero sí columna (compatibilidad)
+             resoluciones = s.nuevos["metodo_resolucion"].value_counts().reset_index()
+             resoluciones.columns = ["Método Resolución", "Cantidad"]
+             st.table(resoluciones)
+             hay_duplicados = True
+        
+        if not hay_duplicados:
+            st.info("No se requirió resolución de duplicados en el match por placa.")
+
+
+    # Tab 9 — Log
+    with t9:
         st.markdown('<p class="slbl">Log de ejecución</p>', unsafe_allow_html=True)
         html = "<br>".join(s.logs) if s.logs else "Sin logs."
         st.markdown(f'<div class="log">{html}</div>', unsafe_allow_html=True)

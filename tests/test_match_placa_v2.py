@@ -144,5 +144,96 @@ class TestMatchPlaca(unittest.TestCase):
         
         self.assertEqual(len(res["nuevos_conciliados"]), 0, "No debería haber match A-A")
 
+    def test_resolucion_duplicados_lejanos(self):
+        """Validar que NO aplica resolución si están lejos (>15s)"""
+        print("\n=== TEST: Resolución Lejanos (Gana Cercanía) ===")
+        
+        # Pendiente (Salida B)
+        df_pend = pd.DataFrame({
+            "datetime": [pd.Timestamp("2023-01-01 10:30:00")],
+            self.CSV_PLACA: ["ABC-123"],
+            "Cuerpo": ["B"],
+            self.CSV_ESTATUS: ["8"],
+            "_placa_norm": ["ABC123"],
+            "origen": ["CSV"]
+        }, index=[0])
+        
+        # Candidatos (Entradas A)
+        # TAG_1: 5 min diff (Cercano). Tiene Placa (para ser candidato válido).
+        # TAG_2: 20 min diff (Lejano). Tiene Placa.
+        # Diferencia entre ellos = 15 min > 15 seg. NO son duplicados entre sí.
+        
+        df_e = pd.DataFrame({
+            "datetime": [
+                pd.Timestamp("2023-01-01 10:25:00"), # TAG_1
+                pd.Timestamp("2023-01-01 10:10:00")  # TAG_2
+            ],
+            "PLACA": [
+                "ABC-123",   # Con placa (Válido)
+                "ABC-123"    # Con placa (Válido)
+            ],
+            "Cuerpo": ["A", "A"],
+            "_placa_norm": ["ABC123", "ABC123"], 
+            "NUMERO_TAG": ["TAG_1", "TAG_2"]
+        }, index=[10, 20])
+        
+        res = match_por_placa(df_pend, df_e, pd.DataFrame())
+        match = res["nuevos_conciliados"].iloc[0]
+        
+        # Debería ganar TAG_1 por ser el MEJOR candidato (más cercano)
+        # Como TAG_2 está muy lejos de TAG_1, no se considera duplicado.
+        print(f"Ganador Lejanos: {match.get('NUMERO_TAG_entrada')} - Método: {match.get('metodo_resolucion')}")
+        self.assertEqual(match.get("NUMERO_TAG_entrada"), "TAG_1", "Debería ganar TAG_1 por cercanía")
+        self.assertIn("Unico", match.get("metodo_resolucion"), "Método debería ser Unico")
+
+    def test_resolucion_duplicados_cercanos(self):
+        """Validar resolución de duplicados en ventana 15s (Cercanía Temporal si ambos tienen Placa)"""
+        print("\n=== TEST: Resolución Cercanos (Conflicto) ===")
+        
+        # Pendiente T=10:30:00
+        df_pend = pd.DataFrame({
+            "datetime": [pd.Timestamp("2023-01-01 10:30:00")],
+            self.CSV_PLACA: ["ABC-123"],
+            "Cuerpo": ["B"],
+            self.CSV_ESTATUS: ["8"],
+            "_placa_norm": ["ABC123"],
+            "origen": ["CSV"]
+        }, index=[0])
+        
+        # Candidatos
+        # A: T=10:29:55 (5s diff). Con Placa.
+        # B: T=10:29:45 (15s diff). Con Placa.
+        # Distancia A-B = 10s <= 15s. SON DUPLICADOS.
+        # Ambos tienen placa -> Empate en Regla 1.
+        # Regla 2: Cercanía Temporal -> A es más cercano (5s vs 15s).
+        
+        df_e = pd.DataFrame({
+            "datetime": [
+                pd.Timestamp("2023-01-01 10:29:55"), # TAG_A
+                pd.Timestamp("2023-01-01 10:29:45")  # TAG_B
+            ],
+            "PLACA": [
+                "ABC-123", 
+                "ABC-123"
+            ],
+            "Cuerpo": ["A", "A"],
+            "_placa_norm": ["ABC123", "ABC123"], 
+            "NUMERO_TAG": ["TAG_A", "TAG_B"]
+        }, index=[100, 200])
+        
+        res = match_por_placa(df_pend, df_e, pd.DataFrame())
+        match = res["nuevos_conciliados"].iloc[0]
+        
+        # Ganador: TAG_A
+        print(f"Ganador Cercanos: {match.get('NUMERO_TAG_entrada')} - Método: {match.get('metodo_resolucion')}")
+        self.assertEqual(match.get("NUMERO_TAG_entrada"), "TAG_A", "Debería ganar TAG_A por cercanía (empate en placa)")
+        
+        # Validar que se detectó duplicado
+        metodo = match.get("metodo_resolucion")
+        self.assertTrue("Duplicado" in metodo or "Cercanía Temporal" in metodo, 
+                        f"Método '{metodo}' debería indicar resolución de duplicado")
+
+
+
 if __name__ == '__main__':
     unittest.main()
