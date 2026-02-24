@@ -1,6 +1,6 @@
 """
 match_placa.py — Match por placa optimizado
-v2: Procesamiento por día + validación 90 min
+v3: Fix orden de columnas consistente
 """
 
 import pandas as pd
@@ -41,57 +41,69 @@ def match_por_placa(
     sin_s["_placa_norm"] = _norm_placa(sin_s, PLACA_CSV)
 
     # Asegurar dia_operativo
-    for df in [pend, sin_e, sin_s]:
+    for df in [pend, sin_e]:
         if "dia_operativo" not in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
             df["dia_operativo"] = df["datetime"].dt.date
 
     nuevos       = []
     idx_e_usados = set()
-    idx_s_usados = set()
+    idx_s_usados = set() # Se mantiene para compatibilidad de retorno, pero no se usa en búsqueda
     idx_pend_sin = []
 
-    print(f"\n[MATCH PLACA] Pendientes: {len(pend):,} | Sin match E: {len(sin_e):,} | S: {len(sin_s):,}")
+    print(f"\n[MATCH PLACA] Pendientes (B): {len(pend):,} | Candidatos Entradas (A): {len(sin_e):,}")
 
     for idx_p, pendiente in pend.iterrows():
+        # ── VALIDACIÓN DIRECCIONALIDAD A-B ─────────────────────────────
+        # El pendiente debe ser SALIDA (B) para buscar en ENTRADA (A).
+        # Si por alguna razón llega un registro que no es B, se salta o se maneja.
+        # Asumimos que ingesta.py ya filtró, pero validamos campo Cuerpo si existe.
+        cuerpo_p = pendiente.get("Cuerpo")
+        if cuerpo_p and cuerpo_p != "B":
+            # Si no es B, no debería estar aquí según la lógica actual (pendientes vienen de Salidas)
+            # O si es A, debería buscar en Salidas, pero el flujo actual es Salidas -> Entradas.
+            print(f"[MATCH PLACA] IGNORADO: Pendiente con Cuerpo '{cuerpo_p}' (se esperaba B)")
+            idx_pend_sin.append(idx_p)
+            continue
+
         placa_p = pendiente.get("_placa_norm", "")
 
         if not placa_p or placa_p == "-":
             idx_pend_sin.append(idx_p)
             continue
 
+        # Solo buscamos en sin_e (Entradas - A)
+        # Nunca buscamos en sin_s (Salidas - B) para evitar match B-B
         mejor_e = _buscar_mejor_placa(
             placa_p, sin_e, idx_e_usados,
             dt_ref=pendiente.get("datetime"), es_entrada=True
         )
 
-        mejor_s = _buscar_mejor_placa(
-            placa_p, sin_s, idx_s_usados,
-            dt_ref=pendiente.get("datetime"), es_entrada=False
-        )
-
-        candidato = None
-        if mejor_e and mejor_s:
-            candidato = mejor_e if mejor_e["score"] >= mejor_s["score"] else mejor_s
-        elif mejor_e:
-            candidato = mejor_e
-        elif mejor_s:
-            candidato = mejor_s
+        candidato = mejor_e
 
         if candidato:
+            # Validación final de direccionalidad antes de aceptar
+            cuerpo_c = candidato["fila"].get("Cuerpo", "A") # Asumimos A para sin_e si no tiene campo
+            
+            # Match válido solo si son opuestos (A vs B)
+            # Como sabemos que pendiente es B (o asumimos), candidato debe ser A.
+            if cuerpo_c == "B":
+                 # Error: Match B-B detectado
+                 print(f"[MATCH PLACA] RECHAZADO: Candidato es Cuerpo B (Salida) para Pendiente {placa_p}")
+                 idx_pend_sin.append(idx_p)
+                 continue
+
             par = _construir_par_placa(pendiente, candidato)
             nuevos.append(par)
-            if candidato["origen"] == "entrada":
-                idx_e_usados.add(candidato["idx"])
-            else:
-                idx_s_usados.add(candidato["idx"])
+            idx_e_usados.add(candidato["idx"])
         else:
             idx_pend_sin.append(idx_p)
 
     df_nuevos     = pd.DataFrame(nuevos) if nuevos else pd.DataFrame()
     df_pend_sin   = pend.loc[idx_pend_sin].drop(columns=["_placa_norm"], errors="ignore").copy()
     df_sin_e_rest = sin_e[~sin_e.index.isin(idx_e_usados)].drop(columns=["_placa_norm"], errors="ignore").copy()
-    df_sin_s_rest = sin_s[~sin_s.index.isin(idx_s_usados)].drop(columns=["_placa_norm"], errors="ignore").copy()
+    # sin_s no se toca en este proceso
+    df_sin_s_rest = sin_s.drop(columns=["_placa_norm"], errors="ignore").copy()
 
     df_pend_sin["motivo"] = "Sin placa con score ≥75% en 90 min"
 
@@ -174,50 +186,50 @@ def _buscar_mejor_placa(placa_p: str, df_candidatos: pd.DataFrame,
 
 
 def _construir_par_placa(pendiente: pd.Series, candidato: dict) -> dict:
+    """
+    Construye par con orden CONSISTENTE de columnas.
+    
+    Estrategia:
+    1. Primero todas las columnas de ENTRADA con sufijo _entrada
+    2. Luego todas las columnas de SALIDA con sufijo _salida
+    3. Al final campos calculados (metodo_match, tiempo, etc)
+    """
     par = {}
     fila = candidato["fila"]
-
-    def copiar_lado(s: pd.Series, lado: str) -> dict:
-        out = {}
-        for k, v in s.items():
-            if k == "_placa_norm":
-                continue
-            key = k
-            if not (k.endswith("_entrada") or k.endswith("_salida")):
-                key = f"{k}_{lado}"
-            if key not in out:
-                out[key] = v
-            else:
-                if pd.isna(out[key]) and not pd.isna(v):
-                    out[key] = v
-        return out
-
+    
+    # Determinar quién es entrada y quién es salida
     if candidato["origen"] == "entrada":
-        entrada_dict = copiar_lado(fila, "entrada")
-        salida_dict  = copiar_lado(pendiente, "salida")
+        entrada_series = fila
+        salida_series  = pendiente
     else:
-        entrada_dict = copiar_lado(pendiente, "entrada")
-        salida_dict  = copiar_lado(fila, "salida")
-
-    for k, v in entrada_dict.items():
-        if k not in par:
-            par[k] = v
-        else:
-            if pd.isna(par[k]) and not pd.isna(v):
-                par[k] = v
-    for k, v in salida_dict.items():
-        if k not in par:
-            par[k] = v
-        else:
-            if pd.isna(par[k]) and not pd.isna(v):
-                par[k] = v
-
-    par["metodo_match"] = "PLACA_DIFUSA"
+        entrada_series = pendiente
+        salida_series  = fila
+    
+    # 🔥 PASO 1: Agregar TODAS las columnas de entrada (orden preservado)
+    for k, v in entrada_series.items():
+        if k == "_placa_norm":  # Saltar columnas internas
+            continue
+        # Asegurar sufijo _entrada
+        col_name = k if k.endswith("_entrada") else f"{k}_entrada"
+        par[col_name] = v
+    
+    # 🔥 PASO 2: Agregar TODAS las columnas de salida (orden preservado)
+    for k, v in salida_series.items():
+        if k == "_placa_norm":
+            continue
+        # Asegurar sufijo _salida
+        col_name = k if k.endswith("_salida") else f"{k}_salida"
+        par[col_name] = v
+    
+    # 🔥 PASO 3: Campos calculados al final (siempre en el mismo orden)
+    par["metodo_match"]    = "PLACA_DIFUSA"
     par["pct_match_placa"] = f"{candidato['score']:.0%}"
-    par["origen"] = "PENDIENTE_PLACA"
-
+    par["origen"]          = "PENDIENTE_PLACA"
+    
+    # Calcular tiempo de recorrido
     dt_e = par.get("datetime_entrada") or par.get("FECHA_HORA_entrada")
-    dt_s = par.get("datetime_salida") or par.get("Fecha Hora_salida")
+    dt_s = par.get("datetime_salida")  or par.get("Fecha Hora_salida")
+    
     if dt_e and dt_s:
         try:
             total_seg = int((pd.Timestamp(dt_s) - pd.Timestamp(dt_e)).total_seconds())
@@ -225,9 +237,16 @@ def _construir_par_placa(pendiente: pd.Series, candidato: dict) -> dict:
                 hh = total_seg // 3600
                 mm = (total_seg % 3600) // 60
                 ss = total_seg % 60
-                par["tiempo_recorrido"] = f"{hh:02d}:{mm:02d}:{ss:02d}"
+                par["tiempo_recorrido"]     = f"{hh:02d}:{mm:02d}:{ss:02d}"
                 par["tiempo_recorrido_min"] = round(total_seg / 60, 1)
+            else:
+                par["tiempo_recorrido"]     = None
+                par["tiempo_recorrido_min"] = None
         except Exception:
-            pass
+            par["tiempo_recorrido"]     = None
+            par["tiempo_recorrido_min"] = None
+    else:
+        par["tiempo_recorrido"]     = None
+        par["tiempo_recorrido_min"] = None
 
     return par

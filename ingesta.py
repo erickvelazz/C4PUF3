@@ -128,6 +128,7 @@ def limpiar_ausur(df: pd.DataFrame) -> dict:
     df_limpios    = df_limpios.drop(columns=cols_aux, errors="ignore")
 
     df_duplicados["motivo_revision"] = "Duplicado AUSUR (mismo Tag ≤10 seg)"
+    df_limpios["Cuerpo"] = "A"  # Identificador para validación de direccionalidad (Entrada)
 
     print(f"[AUSUR] Entradas limpias  : {len(df_limpios):,}")
     print(f"[AUSUR] Duplicados marcados: {len(df_duplicados):,}")
@@ -143,14 +144,15 @@ def limpiar_ausur(df: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 # Estatus que van a la pestaña Pendientes (para match por placa)
-ESTATUS_PENDIENTES = {"4", "8"}
+# Id 8: Utilizar placa para matching. Id 4, 6, 7 ignorados.
+ESTATUS_PENDIENTES = {"8"}
 
 def preparar_salidas_csv(df: pd.DataFrame) -> dict:
     """
     Del CSV de salidas extrae:
       - df_salidas    : tipo B estatus 10  → match por Tag
-      - df_pendientes : tipo B estatus 4 u 8 → match por placa (paso 2)
-      - df_descartados: tipo B cualquier otro estatus
+      - df_pendientes : tipo B estatus 8   → match por placa (paso 2)
+      - df_descartados: tipo B cualquier otro estatus (incluyendo 4, 6, 7)
 
     Retorna dict con las tres tablas.
     """
@@ -168,7 +170,7 @@ def preparar_salidas_csv(df: pd.DataFrame) -> dict:
     df_descartados  = df_b[~mask_10 & ~mask_pend].copy()
 
     print(f"[SALIDAS] Estatus 10 (match Tag)  : {len(df_salidas):,}")
-    print(f"[SALIDAS] Pendientes (est. 4 y 8) : {len(df_pendientes):,}")
+    print(f"[SALIDAS] Pendientes (est. 8)     : {len(df_pendientes):,}")
     print(f"[SALIDAS] Descartados             : {len(df_descartados):,}")
     if CSV_CLASIF in df_descartados.columns and len(df_descartados) > 0:
         for motivo, cnt in df_descartados[CSV_CLASIF].value_counts().items():
